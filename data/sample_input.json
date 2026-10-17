@@ -1,0 +1,61 @@
+[
+  {
+    "organisasjonsnummer": "923609016",
+    "navn": "EQUINOR ASA",
+    "organisasjonsform": {
+      "kode": "ASA",
+      "beskrivelse": "Allment aksjeselskap"
+    },
+    "registreringsdatoEnhetsregisteret": "1997-09-08",
+    "naeringskode1": {
+      "kode": "06.100",
+      "beskrivelse": "Utvinning av råolje og naturgass"
+    },
+    "forretningsadresse": {
+      "adresse": [
+        "Forusbeen 50"
+      ],
+      "postnummer": "4035",
+      "poststed": "STAVANGER",
+      "land": "Norge",
+      "landkode": "NO"
+    },
+    "postadresse": {
+      "adresse": [
+        "Postboks 8500"
+      ],
+      "postnummer": "4035",
+      "poststed": "STAVANGER",
+      "land": "Norge",
+      "landkode": "NO"
+    },
+    "konkurs": false,
+    "underAvvikling": false,
+    "underTvangsavviklingEllerTvangsopplosning": false
+  },
+  {
+    "organisasjonsnummer": "984851006",
+    "navn": "DNB BANK ASA",
+    "organisasjonsform": {
+      "kode": "ASA",
+      "beskrivelse": "Allment aksjeselskap"
+    },
+    "registreringsdatoEnhetsregisteret": "2002-09-10",
+    "naeringskode1": {
+      "kode": "64.190",
+      "beskrivelse": "Bankvirksomhet ellers"
+    },
+    "forretningsadresse": {
+      "adresse": [
+        "Dronning Eufemias gate 30"
+      ],
+      "postnummer": "0191",
+      "poststed": "OSLO",
+      "land": "Norge",
+      "landkode": "NO"
+    },
+    "konkurs": false,
+    "underAvvikling": false,
+    "underTvangsavviklingEllerTvangsopplosning": false
+  }
+]
