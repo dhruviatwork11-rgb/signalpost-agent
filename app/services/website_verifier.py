@@ -136,6 +136,7 @@ class WebsiteVerifier:
                 verification_status="verified",
                 is_parent_or_group=False,
                 evidence_span=f"Found organisation number {org_nr} on page: '{snippet}'",
+                html_content=content_text,
             )
 
         # 2. Domain changed significantly and no org number found -> Likely group/parent redirect
@@ -147,6 +148,7 @@ class WebsiteVerifier:
                 verification_status="ambiguous",
                 is_parent_or_group=True,
                 evidence_span=f"Redirected from {cand_domain} to {final_domain} without target organisation number proof.",
+                html_content=content_text,
             )
 
         # 3. Exact legal name found on own candidate domain
@@ -158,6 +160,7 @@ class WebsiteVerifier:
                 verification_status="verified",
                 is_parent_or_group=False,
                 evidence_span=f"Found exact legal entity name '{clean_name}' on verified domain {final_domain}.",
+                html_content=content_text,
             )
 
         # 4. Domain reached, but neither org number nor legal name confirmed
@@ -168,4 +171,5 @@ class WebsiteVerifier:
             verification_status="ambiguous",
             is_parent_or_group=False,
             evidence_span=f"Website active at {final_url} but does not present verifiable ownership evidence for {legal_name} (org: {org_nr}).",
+            html_content=content_text,
         )

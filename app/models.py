@@ -68,6 +68,7 @@ class VerifiedWebsite(BaseModel):
     is_parent_or_group: bool = False
     evidence_span: Optional[str] = None
     checked_at: datetime = Field(default_factory=utc_now)
+    html_content: Optional[str] = None
 
 
 class SocialProfile(BaseModel):

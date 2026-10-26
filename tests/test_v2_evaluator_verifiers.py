@@ -18,7 +18,15 @@ import json
 import httpx
 import pytest
 
-from app.models import CompanyProfile, SourceEvidence, utc_now
+from app.models import (
+    CompanyProfile,
+    JobPosting,
+    NewsArticle,
+    SocialProfile,
+    SourceEvidence,
+    VerifiedWebsite,
+    utc_now,
+)
 from app.services.batch_runner import BatchRunner, build_terminal_envelope
 from app.services.job_verifier import JobVerifier
 from app.services.news_verifier import NewsVerifier
@@ -544,3 +552,145 @@ def test_envelope_v2_claims_and_evidence_integration(tmp_path):
     assert claims["job_postings"]["availability"] == "available"
     ev_job_id = claims["job_postings"]["evidence_ids"][0]
     assert ev_by_id[ev_job_id]["source_class"] == "public_employment_service"
+
+
+def test_envelope_v2_zero_jobs_and_empty_assets_not_available():
+    """Verify that a checked source with 0 jobs emits not_available (not available)."""
+    profile = CompanyProfile(
+        org_nr="923609016",
+        name="EQUINOR ASA",
+        official_website="https://www.equinor.com",
+        verified_website=VerifiedWebsite(
+            candidate_url="https://www.equinor.com",
+            final_url="https://www.equinor.com",
+            is_verified=True,
+            verification_status="verified",
+        ),
+        social_profiles=[],
+        news_articles=[],
+        job_postings=[],  # 0 jobs from NAV
+    )
+
+    evidence = SourceEvidence(
+        source_name="Enhetsregisteret",
+        source_url="https://data.brreg.no/enhetsregisteret/api/enheter/923609016",
+        response_hash="hash123",
+    )
+
+    envelope = build_terminal_envelope(
+        org_nr="923609016",
+        run_id="v2-test-run",
+        started_at=utc_now(),
+        completed_at=utc_now(),
+        profile=profile,
+        evidence=evidence,
+    )
+
+    claims = {c["field"]: c for c in envelope["claims"]}
+    ev_by_id = {e["id"]: e for e in envelope["evidence"]}
+
+    # Checked job postings with 0 jobs must be 'not_available', backed by Arbeidsplassen evidence
+    assert "job_postings" in claims
+    assert claims["job_postings"]["availability"] == "not_available"
+    assert claims["job_postings"]["value"] is None
+    assert len(claims["job_postings"]["evidence_ids"]) == 1
+    ev_id = claims["job_postings"]["evidence_ids"][0]
+    assert "0 active vacancies found" in ev_by_id[ev_id]["claim_span"]
+
+    # Empty social profiles and news must be 'not_available'
+    assert "social_profiles" in claims
+    assert claims["social_profiles"]["availability"] == "not_available"
+    assert claims["social_profiles"]["value"] is None
+
+    assert "news_articles" in claims
+    assert claims["news_articles"]["availability"] == "not_available"
+    assert claims["news_articles"]["value"] is None
+
+
+def test_batch_runner_wires_social_and_news_from_verified_website(tmp_path):
+    """Test that batch_runner automatically extracts verified social links and news from verified homepage."""
+    from app.services.batch_runner import BatchRunner
+    from app.services.database import DatabaseService
+
+    html_content = """
+    <html>
+      <head>
+        <title>EQUINOR ASA</title>
+        <script type="application/ld+json">
+        {
+          "@context": "https://schema.org",
+          "@type": "NewsArticle",
+          "headline": "Equinor expands offshore wind capacity",
+          "url": "https://www.equinor.com/news/offshore-wind",
+          "datePublished": "2026-10-20T08:00:00Z"
+        }
+        </script>
+      </head>
+      <body>
+        <p>Org.nr: 923 609 016</p>
+        <footer>
+          <a href="https://linkedin.com/company/equinor">LinkedIn</a>
+          <a href="https://facebook.com/sharer.php?u=foo">Share</a>
+        </footer>
+      </body>
+    </html>
+    """
+
+    class MockBrregClient:
+        def fetch_company(self, org_nr):
+            prof = CompanyProfile(
+                org_nr=org_nr,
+                name="EQUINOR ASA",
+                official_website="https://www.equinor.com",
+            )
+            ev = SourceEvidence(
+                source_name="Enhetsregisteret",
+                source_url=f"https://data.brreg.no/enhetsregisteret/api/enheter/{org_nr}",
+                response_hash="abc",
+            )
+            return prof, ev
+
+    class MockWebsiteVerifier:
+        def extract_domain(self, url):
+            return "equinor.com"
+
+        def verify_website(self, candidate_url, org_nr, legal_name):
+            return VerifiedWebsite(
+                candidate_url=candidate_url,
+                final_url=candidate_url,
+                is_verified=True,
+                verification_status="verified",
+                html_content=html_content,
+            )
+
+    class MockJobVerifier:
+        def fetch_nav_vacancies(self, legal_name, org_nr):
+            return []
+
+    db = DatabaseService(tmp_path / "test.db")
+    runner = BatchRunner(db=db, client=MockBrregClient())
+    runner.website_verifier = MockWebsiteVerifier()
+    runner.job_verifier = MockJobVerifier()
+
+    envelope = runner.process_company("923609016", "test-run")
+
+    claims = {c["field"]: c for c in envelope["claims"]}
+
+    # Verified website
+    assert claims["verified_website"]["availability"] == "available"
+    assert claims["verified_website"]["value"] == "https://www.equinor.com"
+
+    # Social profile extracted & verified (share link filtered out)
+    assert claims["social_profiles"]["availability"] == "available"
+    assert claims["social_profiles"]["value"] == ["https://linkedin.com/company/equinor"]
+
+    # News article extracted & verified
+    assert claims["news_articles"]["availability"] == "available"
+    assert len(claims["news_articles"]["value"]) == 1
+    assert claims["news_articles"]["value"][0]["title"] == "Equinor expands offshore wind capacity"
+    assert claims["news_articles"]["value"][0]["publication_date"] == "2026-10-20"
+
+    # 0 jobs -> not_available
+    assert claims["job_postings"]["availability"] == "not_available"
+    assert claims["job_postings"]["value"] is None
+

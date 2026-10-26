@@ -232,7 +232,7 @@ def build_terminal_envelope(
                 })
 
         # 2. Verified Social Profiles
-        if profile.social_profiles:
+        if profile.social_profiles is not None:
             verified_sp = [sp for sp in profile.social_profiles if sp.is_verified]
             if verified_sp:
                 ev_id = f"ev-{len(evidence_list) + 1}"
@@ -255,14 +255,14 @@ def build_terminal_envelope(
             else:
                 claims.append({
                     "field": "social_profiles",
-                    "value": [],
+                    "value": None,
                     "availability": "not_available",
                     "confidence": 0.0,
                     "evidence_ids": [],
                 })
 
         # 3. Verified News Articles
-        if profile.news_articles:
+        if profile.news_articles is not None:
             valid_articles = [na for na in profile.news_articles if not na.is_duplicate and na.publication_date]
             if valid_articles:
                 ev_id = f"ev-{len(evidence_list) + 1}"
@@ -289,7 +289,7 @@ def build_terminal_envelope(
             else:
                 claims.append({
                     "field": "news_articles",
-                    "value": [],
+                    "value": None,
                     "availability": "not_available",
                     "confidence": 0.0,
                     "evidence_ids": [],
@@ -337,8 +337,8 @@ def build_terminal_envelope(
                 })
                 claims.append({
                     "field": "job_postings",
-                    "value": [],
-                    "availability": "available",
+                    "value": None,
+                    "availability": "not_available",
                     "confidence": 1.0,
                     "evidence_ids": [ev_id],
                 })
@@ -403,6 +403,7 @@ class BatchRunner:
     def __init__(
         self,
         db_path: Path | str = DATABASE_PATH,
+        db: Optional[DatabaseService] = None,
         client: Optional[BrregClient] = None,
         website_verifier: Optional[WebsiteVerifier] = None,
         social_verifier: Optional[SocialVerifier] = None,
@@ -412,8 +413,12 @@ class BatchRunner:
         timeout: float = REQUEST_TIMEOUT_SECONDS,
         verify_extended_assets: bool = True,
     ):
-        self.db_path = db_path
-        self.db = DatabaseService(db_path)
+        if db is not None:
+            self.db = db
+            self.db_path = getattr(db, "db_path", db_path)
+        else:
+            self.db_path = db_path
+            self.db = DatabaseService(db_path)
         self.client = client or BrregClient(timeout=timeout)
         injected_http = getattr(self.client, "_http_client", None)
         self.website_verifier = website_verifier or WebsiteVerifier(
@@ -455,7 +460,45 @@ class BatchRunner:
                     except Exception:
                         profile.verified_website = None
 
-                # 2. Individual job postings from NAV / Arbeidsplassen
+                # 2. Social profiles and news articles from verified website
+                if (
+                    profile.verified_website is not None
+                    and profile.verified_website.is_verified
+                    and profile.verified_website.html_content
+                ):
+                    base_url = profile.verified_website.final_url or profile.official_website
+                    src_domain = self.website_verifier.extract_domain(base_url)
+
+                    # Extract & verify candidate social links
+                    try:
+                        cand_social_links = self.social_verifier.extract_candidate_links(
+                            html=profile.verified_website.html_content,
+                            base_url=base_url,
+                        )
+                        for link in cand_social_links[:5]:
+                            sp = self.social_verifier.verify_social_profile(
+                                url=link,
+                                legal_name=profile.name,
+                                org_nr=profile.org_nr,
+                                website_domain=src_domain,
+                            )
+                            if sp.is_verified:
+                                profile.social_profiles.append(sp)
+                    except Exception:
+                        pass
+
+                    # Extract & verify genuine dated news articles
+                    try:
+                        articles = self.news_verifier.extract_from_html(
+                            html=profile.verified_website.html_content,
+                            base_url=base_url,
+                            source_domain=src_domain,
+                        )
+                        profile.news_articles.extend(articles)
+                    except Exception:
+                        pass
+
+                # 3. Individual job postings from NAV / Arbeidsplassen
                 requests_count += 1
                 try:
                     profile.job_postings = self.job_verifier.fetch_nav_vacancies(
