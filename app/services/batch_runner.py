@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import copy
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -24,6 +25,10 @@ from app.services.brreg_client import (
     BrregTimeoutError,
 )
 from app.services.database import DatabaseService
+from app.services.job_verifier import JobVerifier
+from app.services.news_verifier import NewsVerifier
+from app.services.social_verifier import SocialVerifier
+from app.services.website_verifier import WebsiteVerifier
 
 # Allowed availability states according to the official contract
 ALLOWED_AVAILABILITIES = {
@@ -77,7 +82,6 @@ def read_organisation_inputs(path: str | Path) -> list[str]:
         raw_items = [line.strip() for line in text.splitlines() if line.strip()]
 
     org_list: list[str] = []
-    seen = set()
     for item in raw_items:
         if isinstance(item, dict):
             val = (
@@ -134,7 +138,7 @@ def build_terminal_envelope(
     errors_list: list[str] = [error_message] if error_message else []
 
     if profile is not None and evidence is not None:
-        # Structured claims mapped to explicit availability states and unhallucinated evidence spans
+        # Structured base registry claims
         field_specs = [
             ("legal_name", profile.name, f"navn: {profile.name}, organisasjonsnummer: {profile.org_nr}"),
             ("legal_form", profile.org_form, f"organisasjonsform.kode: {profile.org_form}"),
@@ -185,6 +189,158 @@ def build_terminal_envelope(
                     "availability": "not_available",
                     "confidence": 0.0,
                     "evidence_ids": [],
+                })
+
+        # --- Evaluator-Driven Extended Claims (Version 2) ---
+
+        # 1. Verified Website (distinct from unverified registry string)
+        if profile.verified_website is not None:
+            vw = profile.verified_website
+            if vw.is_verified:
+                ev_id = f"ev-{len(evidence_list) + 1}"
+                web_url = vw.final_url or vw.candidate_url
+                evidence_list.append({
+                    "id": ev_id,
+                    "source_url": web_url,
+                    "source_class": "company_owned",
+                    "retrieved_at": format_utc_z(vw.checked_at),
+                    "content_sha256": hashlib.sha256(web_url.encode("utf-8")).hexdigest(),
+                    "claim_span": vw.evidence_span or f"Verified ownership for {profile.name}",
+                })
+                claims.append({
+                    "field": "verified_website",
+                    "value": web_url,
+                    "availability": "available",
+                    "confidence": 1.0,
+                    "evidence_ids": [ev_id],
+                })
+            elif vw.verification_status == "ambiguous":
+                claims.append({
+                    "field": "verified_website",
+                    "value": None,
+                    "availability": "ambiguous",
+                    "confidence": 0.0,
+                    "evidence_ids": [],
+                })
+            else:
+                claims.append({
+                    "field": "verified_website",
+                    "value": None,
+                    "availability": "not_available",
+                    "confidence": 0.0,
+                    "evidence_ids": [],
+                })
+
+        # 2. Verified Social Profiles
+        if profile.social_profiles:
+            verified_sp = [sp for sp in profile.social_profiles if sp.is_verified]
+            if verified_sp:
+                ev_id = f"ev-{len(evidence_list) + 1}"
+                sp_urls = [sp.profile_url for sp in verified_sp]
+                evidence_list.append({
+                    "id": ev_id,
+                    "source_url": verified_sp[0].profile_url,
+                    "source_class": "company_owned",
+                    "retrieved_at": format_utc_z(evidence.retrieved_at),
+                    "content_sha256": hashlib.sha256(",".join(sp_urls).encode("utf-8")).hexdigest(),
+                    "claim_span": f"Verified active profiles: {', '.join(sp.handle or sp.platform for sp in verified_sp)}",
+                })
+                claims.append({
+                    "field": "social_profiles",
+                    "value": sp_urls,
+                    "availability": "available",
+                    "confidence": 1.0,
+                    "evidence_ids": [ev_id],
+                })
+            else:
+                claims.append({
+                    "field": "social_profiles",
+                    "value": [],
+                    "availability": "not_available",
+                    "confidence": 0.0,
+                    "evidence_ids": [],
+                })
+
+        # 3. Verified News Articles
+        if profile.news_articles:
+            valid_articles = [na for na in profile.news_articles if not na.is_duplicate and na.publication_date]
+            if valid_articles:
+                ev_id = f"ev-{len(evidence_list) + 1}"
+                first_art = valid_articles[0]
+                art_data = [
+                    {"title": a.title, "url": a.article_url, "publication_date": a.publication_date}
+                    for a in valid_articles
+                ]
+                evidence_list.append({
+                    "id": ev_id,
+                    "source_url": first_art.article_url,
+                    "source_class": "company_owned",
+                    "retrieved_at": format_utc_z(first_art.retrieval_date),
+                    "content_sha256": hashlib.sha256(first_art.title.encode("utf-8")).hexdigest(),
+                    "claim_span": first_art.evidence_span or f"Dated article: {first_art.title}",
+                })
+                claims.append({
+                    "field": "news_articles",
+                    "value": art_data,
+                    "availability": "available",
+                    "confidence": 1.0,
+                    "evidence_ids": [ev_id],
+                })
+            else:
+                claims.append({
+                    "field": "news_articles",
+                    "value": [],
+                    "availability": "not_available",
+                    "confidence": 0.0,
+                    "evidence_ids": [],
+                })
+
+        # 4. Verified Job Postings (NAV / Arbeidsplassen public register)
+        if profile.job_postings is not None:
+            active_jobs = [j for j in profile.job_postings if j.is_active]
+            ev_id = f"ev-{len(evidence_list) + 1}"
+            if active_jobs:
+                first_job = active_jobs[0]
+                job_data = [
+                    {
+                        "job_title": j.job_title,
+                        "employer": j.employer_name,
+                        "url": j.advertisement_url,
+                        "location": j.location,
+                        "deadline": j.deadline_date,
+                    }
+                    for j in active_jobs
+                ]
+                evidence_list.append({
+                    "id": ev_id,
+                    "source_url": first_job.advertisement_url,
+                    "source_class": "public_employment_service",
+                    "retrieved_at": format_utc_z(evidence.retrieved_at),
+                    "content_sha256": hashlib.sha256(first_job.job_title.encode("utf-8")).hexdigest(),
+                    "claim_span": first_job.evidence_span or f"Active vacancy: {first_job.job_title}",
+                })
+                claims.append({
+                    "field": "job_postings",
+                    "value": job_data,
+                    "availability": "available",
+                    "confidence": 1.0,
+                    "evidence_ids": [ev_id],
+                })
+            else:
+                evidence_list.append({
+                    "id": ev_id,
+                    "source_url": "https://arbeidsplassen.nav.no/stillinger",
+                    "source_class": "public_employment_service",
+                    "retrieved_at": format_utc_z(evidence.retrieved_at),
+                    "content_sha256": hashlib.sha256(f"{profile.org_nr}_no_jobs".encode("utf-8")).hexdigest(),
+                    "claim_span": f"Official Arbeidsplassen register checked for {profile.name}: 0 active vacancies found.",
+                })
+                claims.append({
+                    "field": "job_postings",
+                    "value": [],
+                    "availability": "available",
+                    "confidence": 1.0,
+                    "evidence_ids": [ev_id],
                 })
 
     elif terminal_status == "not_found":
@@ -248,13 +404,28 @@ class BatchRunner:
         self,
         db_path: Path | str = DATABASE_PATH,
         client: Optional[BrregClient] = None,
+        website_verifier: Optional[WebsiteVerifier] = None,
+        social_verifier: Optional[SocialVerifier] = None,
+        news_verifier: Optional[NewsVerifier] = None,
+        job_verifier: Optional[JobVerifier] = None,
         workers: int = 4,
         timeout: float = REQUEST_TIMEOUT_SECONDS,
+        verify_extended_assets: bool = True,
     ):
         self.db_path = db_path
         self.db = DatabaseService(db_path)
         self.client = client or BrregClient(timeout=timeout)
+        injected_http = getattr(self.client, "_http_client", None)
+        self.website_verifier = website_verifier or WebsiteVerifier(
+            timeout=min(timeout, 5.0), http_client=injected_http
+        )
+        self.social_verifier = social_verifier or SocialVerifier()
+        self.news_verifier = news_verifier or NewsVerifier()
+        self.job_verifier = job_verifier or JobVerifier(
+            timeout=min(timeout, 5.0), http_client=injected_http
+        )
         self.workers = max(1, min(workers, 8))  # Bounded concurrency
+        self.verify_extended_assets = verify_extended_assets
 
     def process_company(self, org_nr: str, run_id: str) -> dict[str, Any]:
         """Process a single organization number and return its terminal envelope."""
@@ -269,8 +440,34 @@ class BatchRunner:
 
         try:
             profile, evidence = self.client.fetch_company(org_nr)
+
+            # Extended asset discovery & verification (Version 2)
+            if profile is not None and self.verify_extended_assets:
+                # 1. Website ownership verification
+                if profile.official_website:
+                    requests_count += 1
+                    try:
+                        profile.verified_website = self.website_verifier.verify_website(
+                            candidate_url=profile.official_website,
+                            org_nr=profile.org_nr,
+                            legal_name=profile.name,
+                        )
+                    except Exception:
+                        profile.verified_website = None
+
+                # 2. Individual job postings from NAV / Arbeidsplassen
+                requests_count += 1
+                try:
+                    profile.job_postings = self.job_verifier.fetch_nav_vacancies(
+                        legal_name=profile.name,
+                        org_nr=profile.org_nr,
+                    )
+                except Exception:
+                    profile.job_postings = []
+
             # Transactionally persist and check for historical diffs
             version, changes = self.db.upsert_company_profile(profile, evidence)
+
         except BrregNotFoundError as e:
             error_msg = str(e)
             status_override = "not_found"

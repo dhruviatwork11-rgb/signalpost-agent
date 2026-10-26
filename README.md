@@ -247,13 +247,14 @@ python -m app.main view 923609016
 
 ## Running the Automated Test Suite
 
-All 37 automated tests run completely offline with mocked HTTP responses and isolated databases:
+All 54 automated tests run completely offline with mocked HTTP responses and isolated databases:
 
 ```powershell
 pytest -v
 ```
 
 Test coverage includes:
+- **Evaluator V2 Verifiers (`tests/test_v2_evaluator_verifiers.py`)**: 17 tests verifying website ownership, redirect tracking, parent/brand distinction, template/agency social filtering, publication date extraction, navigation label rejection, NAV Arbeidsplassen individual vacancies, and employer entity matching.
 - **100-company smoke test**: Validates 100 inputs producing 100 compliant envelopes with zero silent drops.
 - **Expanded claims & evidence test**: Validates website, employees, VAT, accounts, sector, municipality, and claim-specific evidence spans.
 - **Deterministic synthesis test**: Verifies grounded `profile_summary` generation without external LLMs.
@@ -261,6 +262,17 @@ Test coverage includes:
 - **Format tests**: Verifies `.json` (arrays, dicts), `.jsonl`, `.txt` (with/without UTF-8 BOM), and Norwegian key variants.
 - **Error classification**: Verifies HTTP 404, timeouts, connection drops, and org number mismatches.
 - **Database & Foreign Keys**: Verifies atomic rollback and constraint enforcement.
+
+---
+
+## Evaluator Concerns Addressed (Version 2)
+
+| Evaluator Concern | Implementation Module | Verification Rules Enforced |
+|---|---|---|
+| **A. Legal Company & Website Ownership** | [`app/services/website_verifier.py`](file:///d:/signalpost%20agent/app/services/website_verifier.py) | Follows redirects safely, records final URL, scans for 9-digit org nr and exact legal name. Flags unverified parent/group domains as `ambiguous` rather than asserting false ownership. |
+| **B. Social Account Verification** | [`app/services/social_verifier.py`](file:///d:/signalpost%20agent/app/services/social_verifier.py) | Verifies handles independently against legal entity name. Rejects share buttons (`sharer.php`), template placeholders (`yourcompany`), agency credits (`wix`, `squarespace`), and parent group accounts. |
+| **C. News Article Verification** | [`app/services/news_verifier.py`](file:///d:/signalpost%20agent/app/services/news_verifier.py) | Extracts genuine news from RSS and JSON-LD. Enforces explicit publication date (`datePublished`), rejects `dateModified` / retrieval timestamps, rejects navigation labels ("See more news"), and deduplicates stories. |
+| **D. Individual Job Advertisements** | [`app/services/job_verifier.py`](file:///d:/signalpost%20agent/app/services/job_verifier.py) | Connects to official NAV Arbeidsplassen public register. Verifies employer entity match, extracts individual vacancy URLs (`/stillinger/stilling/{uuid}`), location, deadline, and rejects generic career landing pages. |
 
 ---
 
@@ -273,7 +285,7 @@ According to the official Signalpost submission requirements:
 | **Run Command** | `python -m app.main batch --input <INPUT_PATH> --output <OUTPUT_PATH> --report <REPORT_PATH>` |
 | **100-Company Smoke Dataset** | [`data/smoke_test_100_companies.json`](file:///d:/signalpost%20agent/data/smoke_test_100_companies.json) |
 | **Output Contract** | Emits 1 terminal JSONL envelope per input following [`OUTPUT_CONTRACT.md`](file:///d:/signalpost%20agent/OUTPUT_CONTRACT.md) |
-| **Declared Models** | None (100% deterministic rule-based extraction and synthesis) |
-| **Declared APIs** | Official Norwegian Enhetsregisteret API (`data.brreg.no`) under NLOD 2.0 |
+| **Declared Models** | None (100% deterministic rule-based extraction and synthesis; zero LLM hallucination risk) |
+| **Declared APIs** | Official Norwegian Enhetsregisteret API (`data.brreg.no`) & NAV Arbeidsplassen (`arbeidsplassen.nav.no`) under NLOD 2.0 |
 | **Third-Party Cost** | **$0.00 USD / 0 NOK** per 100-company run |
 | **Submission Email** | `submit@builderr.ai` |

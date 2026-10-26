@@ -53,6 +53,72 @@ class SourceEvidence(BaseModel):
         return v.astimezone(timezone.utc)
 
 
+class VerifiedWebsite(BaseModel):
+    """Verified website record establishing company ownership."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    candidate_url: str
+    final_url: Optional[str] = None
+    is_verified: bool = False
+    verification_status: str = Field(
+        default="unverified",
+        description="Status: verified, ambiguous, unverified, or unreachable",
+    )
+    is_parent_or_group: bool = False
+    evidence_span: Optional[str] = None
+    checked_at: datetime = Field(default_factory=utc_now)
+
+
+class SocialProfile(BaseModel):
+    """Independently verified social account profile."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    platform: str = Field(..., description="Platform: linkedin, facebook, twitter, instagram, youtube")
+    profile_url: str
+    final_url: Optional[str] = None
+    handle: Optional[str] = None
+    is_verified: bool = False
+    verification_status: str = Field(
+        default="unverified",
+        description="Status: verified, rejected_template, rejected_agency, rejected_parent, or ambiguous",
+    )
+    evidence_span: Optional[str] = None
+
+
+class NewsArticle(BaseModel):
+    """Verified news article associated with company."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    title: str
+    article_url: str
+    source: str
+    publication_date: Optional[str] = Field(
+        default=None, description="Explicit verified publication date (YYYY-MM-DD or ISO-8601)"
+    )
+    retrieval_date: datetime = Field(default_factory=utc_now)
+    evidence_span: Optional[str] = None
+    is_duplicate: bool = False
+
+
+class JobPosting(BaseModel):
+    """Individual job vacancy with employer entity verification."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    job_title: str
+    employer_name: str
+    employer_org_nr: Optional[str] = None
+    advertisement_url: str
+    location: Optional[str] = None
+    publication_date: Optional[str] = None
+    deadline_date: Optional[str] = None
+    is_active: bool = True
+    evidence_span: Optional[str] = None
+
+
 class CompanyProfile(BaseModel):
     """Structured company profile sourced from official public registries."""
 
@@ -122,6 +188,20 @@ class CompanyProfile(BaseModel):
         default=None, description="Foundation date (stiftelsesdato, YYYY-MM-DD)"
     )
 
+    # Evaluator-driven verification assets (Version 2)
+    verified_website: Optional[VerifiedWebsite] = Field(
+        default=None, description="Independently verified company website"
+    )
+    social_profiles: list[SocialProfile] = Field(
+        default_factory=list, description="Verified active social profiles"
+    )
+    news_articles: list[NewsArticle] = Field(
+        default_factory=list, description="Verified dated news articles"
+    )
+    job_postings: list[JobPosting] = Field(
+        default_factory=list, description="Verified active individual vacancies"
+    )
+
     raw_data: Optional[dict[str, Any]] = Field(
         default=None, exclude=True, description="Unmodified response dictionary for auditing"
     )
@@ -168,6 +248,16 @@ class CompanyProfile(BaseModel):
 
         if details:
             parts.append("Key verified details: " + "; ".join(details) + ".")
+
+        extra = []
+        if self.job_postings:
+            extra.append(f"{len(self.job_postings)} active vacancy{'ies' if len(self.job_postings) != 1 else ''}")
+        if self.news_articles:
+            extra.append(f"{len(self.news_articles)} verified news article{'s' if len(self.news_articles) != 1 else ''}")
+        if self.social_profiles:
+            extra.append(f"{len(self.social_profiles)} verified social profile{'s' if len(self.social_profiles) != 1 else ''}")
+        if extra:
+            parts.append("Market presence: " + "; ".join(extra) + ".")
 
         return " ".join(parts)
 

@@ -105,6 +105,18 @@ def init_db(db_path: Path | str) -> None:
                 CREATE INDEX IF NOT EXISTS idx_source_evidence_org ON source_evidence (org_nr);
                 CREATE INDEX IF NOT EXISTS idx_snapshots_org ON company_snapshots (org_nr);
                 CREATE INDEX IF NOT EXISTS idx_changes_org ON change_history (org_nr);
+
+                -- Verified company assets (websites, social profiles, news, jobs)
+                CREATE TABLE IF NOT EXISTS verified_assets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    org_nr TEXT NOT NULL,
+                    asset_type TEXT NOT NULL,
+                    asset_data TEXT NOT NULL,
+                    verification_status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (org_nr) REFERENCES companies (org_nr) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_assets_org ON verified_assets (org_nr, asset_type);
                 """
             )
             # Automatic schema migration for existing databases
@@ -443,6 +455,28 @@ class DatabaseService:
                             (now_iso, profile.org_nr),
                         )
 
+                # Persist verified assets if present (Version 2)
+                if profile.verified_website:
+                    cursor.execute(
+                        "INSERT INTO verified_assets (org_nr, asset_type, asset_data, verification_status, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (profile.org_nr, "website", profile.verified_website.model_dump_json(), profile.verified_website.verification_status, now_iso),
+                    )
+                for sp in profile.social_profiles:
+                    cursor.execute(
+                        "INSERT INTO verified_assets (org_nr, asset_type, asset_data, verification_status, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (profile.org_nr, f"social_{sp.platform}", sp.model_dump_json(), sp.verification_status, now_iso),
+                    )
+                for na in profile.news_articles:
+                    cursor.execute(
+                        "INSERT INTO verified_assets (org_nr, asset_type, asset_data, verification_status, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (profile.org_nr, "news", na.model_dump_json(), "verified", now_iso),
+                    )
+                for jp in profile.job_postings:
+                    cursor.execute(
+                        "INSERT INTO verified_assets (org_nr, asset_type, asset_data, verification_status, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (profile.org_nr, "job", jp.model_dump_json(), "active" if jp.is_active else "inactive", now_iso),
+                    )
+
                 return target_version, changes
         finally:
             conn.close()
@@ -548,6 +582,29 @@ class DatabaseService:
                     response_hash=r["response_hash"],
                     status_code=r["status_code"],
                 )
+                for r in rows
+            ]
+        finally:
+            conn.close()
+
+    def get_verified_assets(self, org_nr: str) -> list[dict[str, Any]]:
+        """Fetch all verified assets (websites, social accounts, news, jobs) for a company."""
+        conn = self.get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM verified_assets WHERE org_nr = ? ORDER BY id ASC",
+                (org_nr,),
+            )
+            rows = cursor.fetchall()
+            return [
+                {
+                    "id": r["id"],
+                    "asset_type": r["asset_type"],
+                    "asset_data": json.loads(r["asset_data"]),
+                    "verification_status": r["verification_status"],
+                    "created_at": r["created_at"],
+                }
                 for r in rows
             ]
         finally:

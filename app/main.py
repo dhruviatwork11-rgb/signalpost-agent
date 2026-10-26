@@ -20,6 +20,8 @@ from app.services.brreg_client import (
     BrregTimeoutError,
 )
 from app.services.database import DatabaseService
+from app.services.job_verifier import JobVerifier
+from app.services.website_verifier import WebsiteVerifier
 
 
 def init_database(db_path: Path | str = DATABASE_PATH) -> int:
@@ -89,6 +91,12 @@ def view_company(org_nr: str, db_path: Path | str = DATABASE_PATH) -> int:
     print(f"Postal Address:      {profile.postal_address.format_single_line() if profile.postal_address else 'Unavailable'}")
     print(f"Municipality:        {profile.municipality or 'Unavailable'} (Code: {profile.municipality_code or 'Unavailable'})")
     print(f"Official Website:    {profile.official_website or 'Unavailable'}")
+    if profile.verified_website:
+        print(f"Verified Website:    {profile.verified_website.final_url or profile.verified_website.candidate_url} ({profile.verified_website.verification_status})")
+    if profile.job_postings:
+        print(f"Active Vacancies:    {len(profile.job_postings)} verified ad(s) in NAV Arbeidsplassen")
+        for j in profile.job_postings[:3]:
+            print(f"  * {j.job_title} ({j.location or 'Norge'}) -> {j.advertisement_url}")
     print(f"Employees:           {profile.employees if profile.employees is not None else 'Unavailable'}")
     print(f"VAT Registered:      {'Yes' if profile.registered_in_vat is True else 'No' if profile.registered_in_vat is False else 'Not indicated in registry'}")
     print(f"Latest Accounts:     {profile.latest_submitted_accounts or 'Unavailable'}")
@@ -111,6 +119,14 @@ def view_company(org_nr: str, db_path: Path | str = DATABASE_PATH) -> int:
         for c in changes:
             print(f"  [v{c.version}] {c.field_name}: '{c.old_value}' -> '{c.new_value}' ({c.detected_at.isoformat()})")
 
+    assets = db.get_verified_assets(org_nr)
+    if assets:
+        print("\nVerified Assets (Version 2):")
+        for a in assets:
+            atype = a["asset_type"]
+            astat = a["verification_status"]
+            print(f"  [{atype}] Status: {astat}")
+
     return 0
 
 
@@ -118,6 +134,7 @@ def lookup_company(
     org_nr: str,
     db_path: Path | str = DATABASE_PATH,
     client: Optional[BrregClient] = None,
+    verify_extended_assets: bool = True,
 ) -> int:
     """
     Perform a live registry lookup against the official Brønnøysund Register Centre API,
@@ -155,6 +172,21 @@ def lookup_company(
         print(f"Unexpected Error during registry lookup: {e}", file=sys.stderr)
         return 1
 
+    # Extended asset discovery & verification (Version 2)
+    if verify_extended_assets and profile is not None:
+        injected_http = getattr(client, "_http_client", None)
+        wv = WebsiteVerifier(http_client=injected_http)
+        jv = JobVerifier(http_client=injected_http)
+        if profile.official_website:
+            try:
+                profile.verified_website = wv.verify_website(profile.official_website, profile.org_nr, profile.name)
+            except Exception:
+                pass
+        try:
+            profile.job_postings = jv.fetch_nav_vacancies(profile.name, profile.org_nr)
+        except Exception:
+            pass
+
     # Save to SQLite transactionally (profile, evidence, snapshot, change history)
     version, changes = db.upsert_company_profile(profile, evidence)
 
@@ -172,6 +204,12 @@ def lookup_company(
     print(f"Postal Address:      {profile.postal_address.format_single_line() if profile.postal_address else 'Unavailable'}")
     print(f"Municipality:        {profile.municipality or 'Unavailable'} (Code: {profile.municipality_code or 'Unavailable'})")
     print(f"Official Website:    {profile.official_website or 'Unavailable'}")
+    if profile.verified_website:
+        print(f"Verified Website:    {profile.verified_website.final_url or profile.verified_website.candidate_url} ({profile.verified_website.verification_status})")
+    if profile.job_postings:
+        print(f"Active Vacancies:    {len(profile.job_postings)} verified ad(s) in NAV Arbeidsplassen")
+        for j in profile.job_postings[:3]:
+            print(f"  * {j.job_title} ({j.location or 'Norge'}) -> {j.advertisement_url}")
     print(f"Employees:           {profile.employees if profile.employees is not None else 'Unavailable'}")
     print(f"VAT Registered:      {'Yes' if profile.registered_in_vat is True else 'No' if profile.registered_in_vat is False else 'Not indicated in registry'}")
     print(f"Latest Accounts:     {profile.latest_submitted_accounts or 'Unavailable'}")
