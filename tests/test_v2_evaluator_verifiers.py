@@ -654,7 +654,7 @@ def test_batch_runner_wires_social_and_news_from_verified_website(tmp_path):
         def extract_domain(self, url):
             return "equinor.com"
 
-        def verify_website(self, candidate_url, org_nr, legal_name):
+        def verify_website(self, candidate_url, org_nr, legal_name, *args, **kwargs):
             return VerifiedWebsite(
                 candidate_url=candidate_url,
                 final_url=candidate_url,
@@ -693,4 +693,167 @@ def test_batch_runner_wires_social_and_news_from_verified_website(tmp_path):
     # 0 jobs -> not_available
     assert claims["job_postings"]["availability"] == "not_available"
     assert claims["job_postings"]["value"] is None
+
+
+def test_job_verifier_strips_legal_suffix_and_discovers_vacancies():
+    """Verify that JobVerifier strips corporate form suffixes and verifies employer matches."""
+    # Employer match verification tests
+    assert JobVerifier.verify_employer_match("Telenor Norge AS", "TELENOR ASA") is True
+    assert JobVerifier.verify_employer_match("Telenor Group", "TELENOR ASA") is True
+    assert JobVerifier.verify_employer_match("Veidekke Entreprenør AS", "VEIDEKKE ASA") is True
+    assert JobVerifier.verify_employer_match("Veidekke Bygg", "VEIDEKKE ASA") is True
+
+    # Rejection of unrelated organizations with shared brand or religious terms
+    assert JobVerifier.verify_employer_match("Telenor Arena Idrettslag", "TELENOR ASA") is False
+    assert JobVerifier.verify_employer_match("Bamble Menighet", "TELENOR ASA") is False
+    assert JobVerifier.verify_employer_match("Equinor Pensjonistforening", "EQUINOR ASA") is False
+
+    # Mock NAV search endpoint
+    recorded_urls = []
+
+    class MockNavClient:
+        def get(self, url, headers=None):
+            recorded_urls.append(url)
+            # Return valid vacancy response
+            payload = {
+                "hits": {
+                    "hits": [
+                        {
+                            "_source": {
+                                "uuid": "job-abc-123",
+                                "title": "Senior Network Engineer",
+                                "status": "ACTIVE",
+                                "businessName": "Telenor Norge AS",
+                                "employer": {"name": "Telenor Norge AS"},
+                                "expires": "2026-12-31T23:59:59",
+                                "published": "2026-10-15T08:00:00",
+                                "locationList": [{"municipal": "OSLO"}],
+                            }
+                        }
+                    ]
+                }
+            }
+            return httpx.Response(200, json=payload, request=httpx.Request("GET", url))
+
+    verifier = JobVerifier(http_client=MockNavClient())
+    postings = verifier.fetch_nav_vacancies("TELENOR ASA", "976632063")
+
+    # Confirms query used clean base name 'TELENOR' without 'ASA'
+    assert any("q=TELENOR" in u and "ASA" not in u for u in recorded_urls)
+    assert len(postings) == 1
+    assert postings[0].job_title == "Senior Network Engineer"
+    assert postings[0].employer_name == "Telenor Norge AS"
+    assert postings[0].advertisement_url == "https://arbeidsplassen.nav.no/stillinger/stilling/job-abc-123"
+
+
+def test_news_homepage_false_positive_rejected():
+    """Verify that root landing pages with article metadata are rejected as news articles."""
+    # URL level checks
+    assert NewsVerifier.is_homepage_url("https://www.yara.com/") is True
+    assert NewsVerifier.is_homepage_url("https://www.yara.com") is True
+    assert NewsVerifier.is_homepage_url("https://www.yara.com/en") is True
+    assert NewsVerifier.is_homepage_url("https://www.yara.com/en/") is True
+    assert NewsVerifier.is_homepage_url("https://www.yara.com/no/forside") is True
+    assert NewsVerifier.is_homepage_url("https://www.yara.com/index.html") is True
+
+    # Real article paths should NOT be flagged as homepages
+    assert NewsVerifier.is_homepage_url("https://www.yara.com/news/q3-results") is False
+    assert NewsVerifier.is_homepage_url("https://www.yara.com/press-releases/2026/fertilizer") is False
+
+    # HTML extraction rejection test: root page claiming to be an article
+    homepage_html = """<!DOCTYPE html>
+    <html>
+    <head>
+        <title>Yara International - Knowledge Grows</title>
+        <meta property="og:type" content="article" />
+        <meta property="og:url" content="https://www.yara.com/" />
+        <meta property="og:title" content="Knowledge Grows - Yara International" />
+        <meta property="article:published_time" content="2022-07-01T12:00:00Z" />
+    </head>
+    <body>Welcome to Yara</body>
+    </html>
+    """
+    verifier = NewsVerifier()
+    articles = verifier.extract_from_html(homepage_html, "https://www.yara.com/")
+    # Root homepage should be rejected, resulting in 0 articles
+    assert len(articles) == 0
+
+
+def test_news_section_link_discovery():
+    """Verify that first-hop internal news links are discovered from homepage HTML."""
+    html = """<!DOCTYPE html>
+    <html>
+    <body>
+        <nav>
+            <a href="/om-oss">Om oss</a>
+            <a href="/nyheter">Aktuelt og Nyheter</a>
+            <a href="/karriere">Karriere</a>
+            <a href="https://external-news.com/news">External</a>
+        </nav>
+    </body>
+    </html>
+    """
+    section_url = NewsVerifier.find_news_section_url(html, "https://example.com")
+    assert section_url == "https://example.com/nyheter"
+
+    # Reject when no news section exists
+    no_news_html = "<html><body><a href='/about'>About</a></body></html>"
+    assert NewsVerifier.find_news_section_url(no_news_html, "https://example.com") is None
+
+
+def test_website_candidate_without_org_nr_or_legal_name_marked_ambiguous():
+    """Verify that candidate websites without exact org nr or legal name are safely marked ambiguous."""
+    html = """<!DOCTYPE html>
+    <html>
+    <head><title>Mowi - Leading the Blue Revolution</title></head>
+    <body>
+        <h1>Welcome to Mowi Global</h1>
+        <p>Sustainable aquaculture and salmon farming.</p>
+    </body>
+    </html>
+    """
+    class MockClient:
+        def get(self, url, headers=None, follow_redirects=True):
+            return httpx.Response(200, text=html, request=httpx.Request("GET", url))
+
+    verifier = WebsiteVerifier(http_client=MockClient())
+
+    # Candidate website without exact legal entity or org number proof is safely marked ambiguous
+    vw = verifier.verify_website(
+        "https://www.mowi.com",
+        org_nr="922401667",
+        legal_name="MOWI ASA",
+    )
+    assert vw.is_verified is False
+    assert vw.verification_status == "ambiguous"
+
+
+def test_website_discovery_for_missing_registry_urls():
+    """Verify candidate domain discovery for companies missing registry websites."""
+    aker_html = """<!DOCTYPE html>
+    <html>
+    <head><title>Aker ASA - Industrial investment company</title></head>
+    <body>
+        <footer>Aker ASA | Org.nr: 886 581 432 | Oksenøyveien 10, 1366 Lysaker</footer>
+    </body>
+    </html>
+    """
+
+    class MockClient:
+        def get(self, url, headers=None, follow_redirects=True):
+            if "akerasa.com" in url or "aker.no" in url:
+                return httpx.Response(200, text=aker_html, request=httpx.Request("GET", url))
+            return httpx.Response(404, request=httpx.Request("GET", url))
+
+    verifier = WebsiteVerifier(http_client=MockClient())
+
+    # Discovery should probe candidate domains and find akerasa.com with verified org nr
+    vw = verifier.discover_candidate_domain(
+        legal_name="AKER ASA",
+        org_nr="886581432",
+    )
+    assert vw is not None
+    assert vw.is_verified is True
+    assert "886581432" in vw.evidence_span or "886 581 432" in vw.evidence_span
+
 

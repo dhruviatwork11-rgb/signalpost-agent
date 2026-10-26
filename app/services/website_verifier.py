@@ -48,6 +48,7 @@ class WebsiteVerifier:
         candidate_url: Optional[str],
         org_nr: str,
         legal_name: str,
+        is_registry_supplied: bool = True,
     ) -> VerifiedWebsite:
         """
         Verify that a candidate website belongs to the exact legal entity.
@@ -163,7 +164,7 @@ class WebsiteVerifier:
                 html_content=content_text,
             )
 
-        # 4. Domain reached, but neither org number nor legal name confirmed
+        # 4. Domain reached, but neither org number nor legal name confirmed -> Ambiguous
         return VerifiedWebsite(
             candidate_url=candidate_url,
             final_url=final_url,
@@ -173,3 +174,55 @@ class WebsiteVerifier:
             evidence_span=f"Website active at {final_url} but does not present verifiable ownership evidence for {legal_name} (org: {org_nr}).",
             html_content=content_text,
         )
+
+    def discover_candidate_domain(
+        self,
+        legal_name: str,
+        org_nr: str,
+    ) -> Optional[VerifiedWebsite]:
+        """
+        Conservative discovery path for entities whose registry website field is empty.
+        Probes standard candidate domains derived from legal name and requires strong entity
+        evidence (exact 9-digit org nr or exact full legal name on the page).
+        """
+        clean_legal = re.sub(r"\s+", " ", legal_name).strip()
+        base_name = re.sub(
+            r"\b(?:ASA|AS|SF|ENK|DA|ANS|BA|FLI|NUF|IKS|KF)\b",
+            "",
+            clean_legal,
+            flags=re.IGNORECASE,
+        ).strip()
+        clean_token = re.sub(r"[^a-zA-Z0-9]", "", base_name).lower()
+        if not clean_token or len(clean_token) < 3:
+            return None
+
+        # Build conservative candidate probe domains
+        probes = [
+            f"https://www.{clean_token}.no",
+            f"https://{clean_token}.no",
+            f"https://{clean_token}asa.com",
+            f"https://www.{clean_token}.com",
+        ]
+
+        seen_hosts = set()
+        for probe_url in probes:
+            host = self.extract_domain(probe_url)
+            if host in seen_hosts:
+                continue
+            seen_hosts.add(host)
+
+            try:
+                # Discovered probes require strong entity proof (exact org nr or exact legal name)
+                vw = self.verify_website(
+                    candidate_url=probe_url,
+                    org_nr=org_nr,
+                    legal_name=legal_name,
+                    is_registry_supplied=False,
+                )
+                if vw.is_verified and vw.final_url:
+                    vw.evidence_span = f"Discovered and verified domain {vw.final_url} for {legal_name}: {vw.evidence_span}"
+                    return vw
+            except Exception:
+                continue
+
+        return None

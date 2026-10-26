@@ -80,6 +80,57 @@ class NewsVerifier:
         return False
 
     @staticmethod
+    def is_homepage_url(url: str, base_url: str = "") -> bool:
+        """Check if URL represents a website homepage or top-level landing page."""
+        try:
+            parsed = urlparse(url)
+            path = parsed.path.strip("/")
+            # Empty path or common language landing paths (e.g. /en, /no, /nb)
+            if not path or path.lower() in {
+                "en",
+                "no",
+                "nb",
+                "privat",
+                "bedrift",
+                "home",
+                "forside",
+                "no/forside",
+                "en/home",
+                "index.html",
+                "default.aspx",
+            }:
+                return True
+            if base_url:
+                base_parsed = urlparse(base_url)
+                if parsed.netloc.lower() == base_parsed.netloc.lower() and path == base_parsed.path.strip("/"):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def find_news_section_url(html: str, base_url: str) -> Optional[str]:
+        """Find the primary news or press releases section link from homepage HTML."""
+        news_link_pattern = re.compile(
+            r'href=[\'"]([^\'"]*(?:/nyheter|/news|/presse|/aktuelt|/press-releases|/media/news)[^\'"]*)[\'"]',
+            re.IGNORECASE,
+        )
+        matches = news_link_pattern.findall(html)
+        base_domain = urlparse(base_url).netloc.lower()
+        if base_domain.startswith("www."):
+            base_domain = base_domain[4:]
+        for m in matches:
+            full_url = urljoin(base_url, m.strip())
+            parsed = urlparse(full_url)
+            host = parsed.netloc.lower()
+            if host.startswith("www."):
+                host = host[4:]
+            if host == base_domain:
+                if not any(token in full_url.lower() for token in ["login", "search", "#"]):
+                    return full_url
+        return None
+
+    @staticmethod
     def parse_iso_date(date_str: str) -> Optional[str]:
         """Validate and format date string as YYYY-MM-DD or ISO-8601 UTC."""
         clean = date_str.strip()
@@ -147,13 +198,14 @@ class NewsVerifier:
 
         return articles
 
-    def extract_from_html(self, html: str, base_url: str, source_domain: str) -> list[NewsArticle]:
+    def extract_from_html(self, html: str, base_url: str, source_domain: Optional[str] = None) -> list[NewsArticle]:
         """
         Extract articles from HTML structured data (JSON-LD NewsArticle / OpenGraph metadata).
         Strictly distinguishes datePublished from dateModified or retrieval timestamps.
         """
         articles: list[NewsArticle] = []
         seen_titles: set[str] = set()
+        effective_source = source_domain or urlparse(base_url).netloc
 
         # 1. Search for JSON-LD structured data
         json_ld_blocks = re.findall(r'<script[^>]+type=[\'"]application/ld\+json[\'"][^>]*>(.*?)</script>', html, re.DOTALL | re.IGNORECASE)
@@ -165,10 +217,13 @@ class NewsVerifier:
                     item_type = item.get("@type", "")
                     if item_type in ("NewsArticle", "Article", "BlogPosting", "PressRelease"):
                         title = str(item.get("headline") or item.get("name") or "").strip()
-                        url = str(item.get("url") or item.get("mainEntityOfPage") or base_url).strip()
+                        raw_url = str(item.get("url") or item.get("mainEntityOfPage") or base_url).strip()
+                        full_url = urljoin(base_url, raw_url)
                         raw_pub = str(item.get("datePublished") or "").strip()
 
                         if not title or self.is_navigation_label(title):
+                            continue
+                        if self.is_homepage_url(full_url, base_url) or self.is_category_url(full_url):
                             continue
                         pub_date = self.parse_iso_date(raw_pub) if raw_pub else None
                         if not pub_date:
@@ -180,8 +235,8 @@ class NewsVerifier:
                             articles.append(
                                 NewsArticle(
                                     title=title,
-                                    article_url=urljoin(base_url, url),
-                                    source=source_domain,
+                                    article_url=full_url,
+                                    source=effective_source,
                                     publication_date=pub_date,
                                     retrieval_date=utc_now(),
                                     evidence_span=f"Verified JSON-LD datePublished '{pub_date}' for '{title}'.",
@@ -200,15 +255,21 @@ class NewsVerifier:
             if og_title_m and og_date_m:
                 title = og_title_m.group(1).strip()
                 raw_date = og_date_m.group(1).strip()
-                url = og_url_m.group(1).strip() if og_url_m else base_url
+                raw_url = og_url_m.group(1).strip() if og_url_m else base_url
+                full_url = urljoin(base_url, raw_url)
                 pub_date = self.parse_iso_date(raw_date)
 
-                if pub_date and not self.is_navigation_label(title) and not self.is_category_url(url):
+                if (
+                    pub_date
+                    and not self.is_navigation_label(title)
+                    and not self.is_homepage_url(full_url, base_url)
+                    and not self.is_category_url(full_url)
+                ):
                     articles.append(
                         NewsArticle(
                             title=title,
-                            article_url=url,
-                            source=source_domain,
+                            article_url=full_url,
+                            source=effective_source,
                             publication_date=pub_date,
                             retrieval_date=utc_now(),
                             evidence_span=f"Verified OpenGraph article:published_time '{pub_date}'.",

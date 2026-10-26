@@ -230,6 +230,14 @@ def build_terminal_envelope(
                     "confidence": 0.0,
                     "evidence_ids": [],
                 })
+        else:
+            claims.append({
+                "field": "verified_website",
+                "value": None,
+                "availability": "not_available",
+                "confidence": 0.0,
+                "evidence_ids": [],
+            })
 
         # 2. Verified Social Profiles
         if profile.social_profiles is not None:
@@ -456,7 +464,28 @@ class BatchRunner:
                             candidate_url=profile.official_website,
                             org_nr=profile.org_nr,
                             legal_name=profile.name,
+                            is_registry_supplied=True,
                         )
+                    except TypeError:
+                        try:
+                            profile.verified_website = self.website_verifier.verify_website(
+                                candidate_url=profile.official_website,
+                                org_nr=profile.org_nr,
+                                legal_name=profile.name,
+                            )
+                        except Exception:
+                            profile.verified_website = None
+                    except Exception:
+                        profile.verified_website = None
+                else:
+                    # Conservative discovery path for missing registry websites
+                    try:
+                        disc_vw = self.website_verifier.discover_candidate_domain(
+                            legal_name=profile.name,
+                            org_nr=profile.org_nr,
+                        )
+                        if disc_vw and disc_vw.is_verified:
+                            profile.verified_website = disc_vw
                     except Exception:
                         profile.verified_website = None
 
@@ -494,6 +523,30 @@ class BatchRunner:
                             base_url=base_url,
                             source_domain=src_domain,
                         )
+                        # If no articles on root page, inspect primary news sub-page
+                        if not articles:
+                            news_sub_url = self.news_verifier.find_news_section_url(
+                                html=profile.verified_website.html_content,
+                                base_url=base_url,
+                            )
+                            if news_sub_url:
+                                try:
+                                    headers = {"User-Agent": self.website_verifier.user_agent}
+                                    if self.website_verifier._http_client is not None:
+                                        resp = self.website_verifier._http_client.get(news_sub_url, headers=headers)
+                                    else:
+                                        with httpx.Client(timeout=3.0, follow_redirects=True) as client:
+                                            resp = client.get(news_sub_url, headers=headers)
+                                    if resp.status_code < 400:
+                                        sub_articles = self.news_verifier.extract_from_html(
+                                            html=resp.text[:524288],
+                                            base_url=news_sub_url,
+                                            source_domain=src_domain,
+                                        )
+                                        articles.extend(sub_articles)
+                                except Exception:
+                                    pass
+
                         profile.news_articles.extend(articles)
                     except Exception:
                         pass

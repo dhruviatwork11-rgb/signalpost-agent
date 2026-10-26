@@ -64,17 +64,26 @@ class JobVerifier:
         if c_emp == t_name or c_emp in t_name or t_name in c_emp:
             return True
 
-        # Check token overlap excluding generic legal suffixes
-        c_tokens = {
-            tok for tok in c_emp.split()
-            if tok not in {"as", "asa", "avd", "norge", "holding", "group"} and len(tok) >= 3
-        }
-        t_tokens = {
-            tok for tok in t_name.split()
-            if tok not in {"as", "asa", "avd", "norge", "holding", "group"} and len(tok) >= 3
-        }
+        # Strip standard corporate and geographic suffixes
+        generic_suffixes = {"as", "asa", "avd", "norge", "norway", "holding", "group", "gruppen"}
+        c_tokens = [tok for tok in c_emp.split() if tok not in generic_suffixes and len(tok) >= 3]
+        t_tokens = [tok for tok in t_name.split() if tok not in generic_suffixes and len(tok) >= 3]
 
-        if c_tokens and t_tokens and (c_tokens & t_tokens):
+        if not t_tokens or not c_tokens:
+            return False
+
+        # First token of target is typically the primary brand (e.g. "Veidekke", "Telenor", "Kongsberg", "Bouvet", "Posten")
+        primary_brand = t_tokens[0]
+        if primary_brand in c_tokens:
+            # If primary brand matches, check that candidate is not an unrelated church/club/association
+            unrelated_indicators = {"kirke", "menighet", "idrettslag", "klubb", "forening", "borettslag"}
+            if any(ind in c_emp for ind in unrelated_indicators) and not any(ind in t_name for ind in unrelated_indicators):
+                return False
+            return True
+
+        # Check general distinctive token overlap
+        common = set(c_tokens) & set(t_tokens)
+        if common - {"bygg", "invest", "data", "consulting", "service", "eiendom"}:
             return True
 
         return False
@@ -90,37 +99,65 @@ class JobVerifier:
         Verifies employer entity match, extracts individual posting URLs, locations,
         and application deadlines, and rejects generic career landing pages.
         """
-        clean_name = re.sub(r"\s+", " ", legal_name).strip()
-        quoted_query = f'"{clean_name}"'
-        url = f"{self.base_api_url}?q={quote(quoted_query)}&size={max_results}"
+        clean_legal = re.sub(r"\s+", " ", legal_name).strip()
+
+        # Extract normalized company name without corporate form suffix
+        base_name = re.sub(
+            r"\b(?:ASA|AS|SF|ENK|DA|ANS|BA|FLI|NUF|IKS|KF)\b",
+            "",
+            clean_legal,
+            flags=re.IGNORECASE,
+        ).strip()
+        clean_base = re.sub(r"\s+", " ", base_name).strip()
+
+        # Prioritize search by clean base name (e.g. "Telenor", "Veidekke"), then legal name
+        search_terms = []
+        if clean_base and len(clean_base) >= 2:
+            search_terms.append(clean_base)
+        if clean_legal not in search_terms:
+            search_terms.append(clean_legal)
 
         headers = {
             "Accept": "application/json",
             "User-Agent": self.user_agent,
         }
 
-        try:
-            if self._http_client is not None:
-                response = self._http_client.get(url, headers=headers)
-            else:
-                with httpx.Client(timeout=self.timeout) as client:
-                    response = client.get(url, headers=headers)
-        except Exception:
-            return []
+        all_hits = []
+        seen_uuids = set()
 
-        if response.status_code != 200:
-            return []
+        for term in search_terms:
+            url = f"{self.base_api_url}?q={quote(term)}&size={max_results * 2}"
+            try:
+                if self._http_client is not None:
+                    response = self._http_client.get(url, headers=headers)
+                else:
+                    with httpx.Client(timeout=self.timeout) as client:
+                        response = client.get(url, headers=headers)
+            except Exception:
+                continue
 
-        try:
-            payload = response.json()
-        except Exception:
-            return []
+            if response.status_code != 200:
+                continue
 
-        hits = payload.get("hits", {}).get("hits", [])
+            try:
+                payload = response.json()
+            except Exception:
+                continue
+
+            raw_hits = payload.get("hits", {})
+            hit_list = raw_hits.get("hits", []) if isinstance(raw_hits, dict) else []
+            for h in hit_list:
+                uuid = h.get("_source", {}).get("uuid")
+                if uuid and uuid not in seen_uuids:
+                    seen_uuids.add(uuid)
+                    all_hits.append(h)
+
+            if len(all_hits) >= max_results:
+                break
+
         postings: list[JobPosting] = []
-
         now_utc = utc_now()
-        for hit in hits:
+        for hit in all_hits:
             source = hit.get("_source", {})
             uuid = source.get("uuid")
             if not uuid:
@@ -188,5 +225,8 @@ class JobVerifier:
                     evidence_span=f"Official NAV Arbeidsplassen vacancy {uuid} for employer '{employer_name}'.",
                 )
             )
+
+            if len(postings) >= max_results:
+                break
 
         return postings
