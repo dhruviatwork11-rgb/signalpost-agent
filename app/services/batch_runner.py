@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import copy
 from datetime import datetime, timezone
 import hashlib
+import httpx
 import json
 from pathlib import Path
 import re
@@ -270,86 +271,121 @@ def build_terminal_envelope(
                 })
 
         # 3. Verified News Articles
-        if profile.news_articles is not None:
-            valid_articles = [na for na in profile.news_articles if not na.is_duplicate and na.publication_date]
-            if valid_articles:
-                ev_id = f"ev-{len(evidence_list) + 1}"
-                first_art = valid_articles[0]
-                art_data = [
-                    {"title": a.title, "url": a.article_url, "publication_date": a.publication_date}
-                    for a in valid_articles
-                ]
-                evidence_list.append({
-                    "id": ev_id,
-                    "source_url": first_art.article_url,
-                    "source_class": "company_owned",
-                    "retrieved_at": format_utc_z(first_art.retrieval_date),
-                    "content_sha256": hashlib.sha256(first_art.title.encode("utf-8")).hexdigest(),
-                    "claim_span": first_art.evidence_span or f"Dated article: {first_art.title}",
-                })
-                claims.append({
-                    "field": "news_articles",
-                    "value": art_data,
-                    "availability": "available",
-                    "confidence": 1.0,
-                    "evidence_ids": [ev_id],
-                })
-            else:
-                claims.append({
-                    "field": "news_articles",
-                    "value": None,
-                    "availability": "not_available",
-                    "confidence": 0.0,
-                    "evidence_ids": [],
-                })
+        news_status = getattr(profile, "news_search_status", "completed")
+        valid_articles = [na for na in (profile.news_articles or []) if not na.is_duplicate and na.publication_date]
+        if valid_articles:
+            ev_id = f"ev-{len(evidence_list) + 1}"
+            first_art = valid_articles[0]
+            art_data = [
+                {"title": a.title, "url": a.article_url, "publication_date": a.publication_date}
+                for a in valid_articles
+            ]
+            evidence_list.append({
+                "id": ev_id,
+                "source_url": first_art.article_url,
+                "source_class": "company_owned",
+                "retrieved_at": format_utc_z(first_art.retrieval_date),
+                "content_sha256": hashlib.sha256(first_art.title.encode("utf-8")).hexdigest(),
+                "claim_span": first_art.evidence_span or f"Dated article: {first_art.title}",
+            })
+            claims.append({
+                "field": "news_articles",
+                "value": art_data,
+                "availability": "available",
+                "confidence": 1.0,
+                "evidence_ids": [ev_id],
+            })
+        elif news_status == "not_applicable" or not profile.verified_website or not profile.verified_website.is_verified:
+            claims.append({
+                "field": "news_articles",
+                "value": None,
+                "availability": "not_applicable",
+                "confidence": 1.0,
+                "evidence_ids": [],
+            })
+        else:
+            claims.append({
+                "field": "news_articles",
+                "value": None,
+                "availability": "not_available",
+                "confidence": 1.0,
+                "evidence_ids": [],
+            })
 
         # 4. Verified Job Postings (NAV / Arbeidsplassen public register)
-        if profile.job_postings is not None:
-            active_jobs = [j for j in profile.job_postings if j.is_active]
-            ev_id = f"ev-{len(evidence_list) + 1}"
-            if active_jobs:
-                first_job = active_jobs[0]
-                job_data = [
-                    {
-                        "job_title": j.job_title,
-                        "employer": j.employer_name,
-                        "url": j.advertisement_url,
-                        "location": j.location,
-                        "deadline": j.deadline_date,
-                    }
-                    for j in active_jobs
-                ]
-                evidence_list.append({
-                    "id": ev_id,
-                    "source_url": first_job.advertisement_url,
-                    "source_class": "public_employment_service",
-                    "retrieved_at": format_utc_z(evidence.retrieved_at),
-                    "content_sha256": hashlib.sha256(first_job.job_title.encode("utf-8")).hexdigest(),
-                    "claim_span": first_job.evidence_span or f"Active vacancy: {first_job.job_title}",
-                })
-                claims.append({
-                    "field": "job_postings",
-                    "value": job_data,
-                    "availability": "available",
-                    "confidence": 1.0,
-                    "evidence_ids": [ev_id],
-                })
-            else:
-                evidence_list.append({
-                    "id": ev_id,
-                    "source_url": "https://arbeidsplassen.nav.no/stillinger",
-                    "source_class": "public_employment_service",
-                    "retrieved_at": format_utc_z(evidence.retrieved_at),
-                    "content_sha256": hashlib.sha256(f"{profile.org_nr}_no_jobs".encode("utf-8")).hexdigest(),
-                    "claim_span": f"Official Arbeidsplassen register checked for {profile.name}: 0 active vacancies found.",
-                })
-                claims.append({
-                    "field": "job_postings",
-                    "value": None,
-                    "availability": "not_available",
-                    "confidence": 1.0,
-                    "evidence_ids": [ev_id],
-                })
+        job_status = getattr(profile, "job_search_status", "completed")
+        active_jobs = [j for j in (profile.job_postings or []) if j.is_active]
+        ev_id = f"ev-{len(evidence_list) + 1}"
+
+        if active_jobs:
+            first_job = active_jobs[0]
+            job_data = [
+                {
+                    "job_title": j.job_title,
+                    "employer": j.employer_name,
+                    "url": j.advertisement_url,
+                    "location": j.location,
+                    "deadline": j.deadline_date,
+                }
+                for j in active_jobs
+            ]
+            evidence_list.append({
+                "id": ev_id,
+                "source_url": first_job.advertisement_url,
+                "source_class": "public_employment_service",
+                "retrieved_at": format_utc_z(evidence.retrieved_at),
+                "content_sha256": hashlib.sha256(first_job.job_title.encode("utf-8")).hexdigest(),
+                "claim_span": first_job.evidence_span or f"Active vacancy: {first_job.job_title}",
+            })
+            claims.append({
+                "field": "job_postings",
+                "value": job_data,
+                "availability": "available",
+                "confidence": 1.0,
+                "evidence_ids": [ev_id],
+            })
+        elif job_status == "blocked":
+            evidence_list.append({
+                "id": ev_id,
+                "source_url": "https://arbeidsplassen.nav.no/stillinger",
+                "source_class": "public_employment_service",
+                "retrieved_at": format_utc_z(evidence.retrieved_at),
+                "content_sha256": hashlib.sha256(f"{profile.org_nr}_blocked".encode("utf-8")).hexdigest(),
+                "claim_span": f"Official Arbeidsplassen register rate-limited (HTTP 429) for {profile.name}. Source not successfully checked.",
+            })
+            claims.append({
+                "field": "job_postings",
+                "value": None,
+                "availability": "blocked",
+                "confidence": 0.0,
+                "evidence_ids": [ev_id],
+            })
+        elif job_status == "failed":
+            claims.append({
+                "field": "job_postings",
+                "value": None,
+                "availability": "failed",
+                "confidence": 0.0,
+                "evidence_ids": [],
+            })
+            errors_list.append(f"Job search failed for {profile.name}")
+        else:
+            # Completed with 0 vacancies
+            evidence_list.append({
+                "id": ev_id,
+                "source_url": "https://arbeidsplassen.nav.no/stillinger",
+                "source_class": "public_employment_service",
+                "retrieved_at": format_utc_z(evidence.retrieved_at),
+                "content_sha256": hashlib.sha256(f"{profile.org_nr}_no_jobs".encode("utf-8")).hexdigest(),
+                "claim_span": f"Official Arbeidsplassen register checked for {profile.name}: 0 active vacancies found.",
+            })
+            claims.append({
+                "field": "job_postings",
+                "value": None,
+                "availability": "not_available",
+                "confidence": 1.0,
+                "evidence_ids": [ev_id],
+            })
 
     elif terminal_status == "not_found":
         claims.append({
@@ -518,12 +554,37 @@ class BatchRunner:
 
                     # Extract & verify genuine dated news articles
                     try:
-                        articles = self.news_verifier.extract_from_html(
+                        articles = []
+                        # Step 1: Discover and inspect corporate RSS/Atom feeds
+                        feed_urls = self.news_verifier.find_rss_feed_urls(
                             html=profile.verified_website.html_content,
                             base_url=base_url,
-                            source_domain=src_domain,
                         )
-                        # If no articles on root page, inspect primary news sub-page
+                        for f_url in feed_urls[:2]:
+                            try:
+                                headers = {"User-Agent": self.website_verifier.user_agent}
+                                if self.website_verifier._http_client is not None:
+                                    f_resp = self.website_verifier._http_client.get(f_url, headers=headers)
+                                else:
+                                    with httpx.Client(timeout=4.0, follow_redirects=True) as client:
+                                        f_resp = client.get(f_url, headers=headers)
+                                if f_resp.status_code == 200:
+                                    feed_arts = self.news_verifier.extract_from_rss(f_resp.text, src_domain)
+                                    articles.extend(feed_arts)
+                            except Exception:
+                                pass
+                            if articles:
+                                break
+
+                        # Step 2: Extract from root HTML if no RSS articles
+                        if not articles:
+                            articles = self.news_verifier.extract_from_html(
+                                html=profile.verified_website.html_content,
+                                base_url=base_url,
+                                source_domain=src_domain,
+                            )
+
+                        # Step 3: If still no articles on root page, inspect primary news sub-page
                         if not articles:
                             news_sub_url = self.news_verifier.find_news_section_url(
                                 html=profile.verified_website.html_content,
@@ -535,7 +596,7 @@ class BatchRunner:
                                     if self.website_verifier._http_client is not None:
                                         resp = self.website_verifier._http_client.get(news_sub_url, headers=headers)
                                     else:
-                                        with httpx.Client(timeout=3.0, follow_redirects=True) as client:
+                                        with httpx.Client(timeout=4.0, follow_redirects=True) as client:
                                             resp = client.get(news_sub_url, headers=headers)
                                     if resp.status_code < 400:
                                         sub_articles = self.news_verifier.extract_from_html(
@@ -548,8 +609,12 @@ class BatchRunner:
                                     pass
 
                         profile.news_articles.extend(articles)
+                        profile.news_search_status = "completed"
                     except Exception:
-                        pass
+                        profile.news_search_status = "failed"
+                else:
+                    # No verified website available to check for news
+                    profile.news_search_status = "not_applicable"
 
                 # 3. Individual job postings from NAV / Arbeidsplassen
                 requests_count += 1
@@ -558,8 +623,10 @@ class BatchRunner:
                         legal_name=profile.name,
                         org_nr=profile.org_nr,
                     )
+                    profile.job_search_status = getattr(profile.job_postings, "status", "completed")
                 except Exception:
                     profile.job_postings = []
+                    profile.job_search_status = "failed"
 
             # Transactionally persist and check for historical diffs
             version, changes = self.db.upsert_company_profile(profile, evidence)

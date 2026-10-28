@@ -202,6 +202,14 @@ class CompanyProfile(BaseModel):
     job_postings: list[JobPosting] = Field(
         default_factory=list, description="Verified active individual vacancies"
     )
+    job_search_status: str = Field(
+        default="completed",
+        description="NAV Arbeidsplassen search status: completed, blocked, failed, or not_checked",
+    )
+    news_search_status: str = Field(
+        default="completed",
+        description="News discovery status: completed, not_applicable, or failed",
+    )
 
     raw_data: Optional[dict[str, Any]] = Field(
         default=None, exclude=True, description="Unmodified response dictionary for auditing"

@@ -3,6 +3,8 @@
 from datetime import datetime, timezone
 import json
 import re
+import threading
+import time
 from typing import Any, Optional
 from urllib.parse import quote, urlparse
 import httpx
@@ -22,8 +24,30 @@ GENERIC_CAREERS_PATTERNS = [
 ]
 
 
+class JobPostingList(list):
+    """List of JobPosting objects with source search metadata for contract reporting."""
+
+    def __init__(
+        self,
+        items=(),
+        status: str = "completed",
+        search_url: str = "",
+        query_term: str = "",
+        error_message: Optional[str] = None,
+    ):
+        super().__init__(items)
+        self.status = status  # completed, blocked, failed
+        self.search_url = search_url
+        self.query_term = query_term
+        self.error_message = error_message
+
+
 class JobVerifier:
     """Discovers, validates, and verifies individual job advertisements."""
+
+    _lock = threading.Lock()
+    _last_request_ts = 0.0
+    _min_request_interval = 1.1  # Seconds between requests to live Arbeidsplassen endpoint
 
     def __init__(
         self,
@@ -36,6 +60,26 @@ class JobVerifier:
         self.timeout = timeout
         self.user_agent = user_agent
         self._http_client = http_client
+
+    def _execute_request(self, url: str, headers: dict[str, str]) -> tuple[Optional[httpx.Response], Optional[str]]:
+        """Pace requests to NAV Arbeidsplassen public API with inter-thread rate limiting."""
+        if "arbeidsplassen.nav.no" in url and self._http_client is None:
+            with JobVerifier._lock:
+                now = time.monotonic()
+                elapsed = now - JobVerifier._last_request_ts
+                if elapsed < JobVerifier._min_request_interval:
+                    time.sleep(JobVerifier._min_request_interval - elapsed)
+                JobVerifier._last_request_ts = time.monotonic()
+
+        try:
+            if self._http_client is not None:
+                response = self._http_client.get(url, headers=headers)
+            else:
+                with httpx.Client(timeout=self.timeout) as client:
+                    response = client.get(url, headers=headers)
+            return response, None
+        except Exception as exc:
+            return None, str(exc)
 
     @staticmethod
     def is_generic_careers_url(url: str) -> bool:
@@ -74,9 +118,16 @@ class JobVerifier:
 
         # First token of target is typically the primary brand (e.g. "Veidekke", "Telenor", "Kongsberg", "Bouvet", "Posten")
         primary_brand = t_tokens[0]
+        c_primary = c_tokens[0]
+
+        # Reject if candidate has a conflicting, distinct corporate brand prefix
+        # e.g., target 'Norsk Hydro' vs candidate 'Voith Hydro' (c_primary is 'voith' != 'norsk')
+        if primary_brand != c_primary and c_primary not in t_tokens:
+            return False
+
         if primary_brand in c_tokens:
             # If primary brand matches, check that candidate is not an unrelated church/club/association
-            unrelated_indicators = {"kirke", "menighet", "idrettslag", "klubb", "forening", "borettslag"}
+            unrelated_indicators = {"kirke", "menighet", "idrettslag", "klubb", "forening", "borettslag", "pensjonistforening"}
             if any(ind in c_emp for ind in unrelated_indicators) and not any(ind in t_name for ind in unrelated_indicators):
                 return False
             return True
@@ -93,11 +144,12 @@ class JobVerifier:
         legal_name: str,
         org_nr: str,
         max_results: int = 5,
-    ) -> list[JobPosting]:
+    ) -> JobPostingList:
         """
         Query NAV / Arbeidsplassen public API for individual vacancies.
         Verifies employer entity match, extracts individual posting URLs, locations,
         and application deadlines, and rejects generic career landing pages.
+        Returns a JobPostingList preserving search status (completed, blocked, or failed).
         """
         clean_legal = re.sub(r"\s+", " ", legal_name).strip()
 
@@ -110,7 +162,7 @@ class JobVerifier:
         ).strip()
         clean_base = re.sub(r"\s+", " ", base_name).strip()
 
-        # Prioritize search by clean base name (e.g. "Telenor", "Veidekke"), then legal name
+        # Prioritize search by clean base name (e.g. "Telenor", "Veidekke"), then legal name fallback
         search_terms = []
         if clean_base and len(clean_base) >= 2:
             search_terms.append(clean_base)
@@ -124,24 +176,46 @@ class JobVerifier:
 
         all_hits = []
         seen_uuids = set()
+        search_status = "completed"
+        last_search_url = ""
+        effective_term = search_terms[0] if search_terms else clean_legal
+        last_error = None
 
         for term in search_terms:
+            effective_term = term
             url = f"{self.base_api_url}?q={quote(term)}&size={max_results * 2}"
-            try:
-                if self._http_client is not None:
-                    response = self._http_client.get(url, headers=headers)
-                else:
-                    with httpx.Client(timeout=self.timeout) as client:
-                        response = client.get(url, headers=headers)
-            except Exception:
+            last_search_url = url
+
+            response, err = self._execute_request(url, headers)
+            if err:
+                search_status = "failed"
+                last_error = err
                 continue
 
+            if response is None:
+                search_status = "failed"
+                continue
+
+            if response.status_code == 429:
+                search_status = "blocked"
+                # Conservative retry with backoff if rate limited
+                time.sleep(2.0)
+                response, err = self._execute_request(url, headers)
+                if response and response.status_code == 200:
+                    search_status = "completed"
+                else:
+                    search_status = "blocked"
+                    break
+
             if response.status_code != 200:
+                search_status = "failed" if response.status_code >= 500 else "blocked"
                 continue
 
             try:
                 payload = response.json()
-            except Exception:
+            except Exception as e:
+                search_status = "failed"
+                last_error = str(e)
                 continue
 
             raw_hits = payload.get("hits", {})
@@ -152,7 +226,9 @@ class JobVerifier:
                     seen_uuids.add(uuid)
                     all_hits.append(h)
 
-            if len(all_hits) >= max_results:
+            search_status = "completed"
+            # Single-query optimization: if first term yielded hits, do not query the second term
+            if all_hits:
                 break
 
         postings: list[JobPosting] = []
@@ -229,4 +305,10 @@ class JobVerifier:
             if len(postings) >= max_results:
                 break
 
-        return postings
+        return JobPostingList(
+            postings,
+            status=search_status,
+            search_url=last_search_url or self.base_api_url,
+            query_term=effective_term,
+            error_message=last_error,
+        )

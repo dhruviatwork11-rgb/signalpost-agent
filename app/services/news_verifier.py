@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 import hashlib
+import html as html_lib
 import json
 import re
 from typing import Optional
@@ -35,6 +36,16 @@ NAVIGATION_LABELS = {
     "hjem",
     "blog",
     "blogg",
+    "finn butikk",
+    "alle butikker",
+    "alle butikker og åpningstider",
+    "butikker og åpningstider",
+    "åpningstider",
+    "om oss",
+    "om selskapet",
+    "kontakt oss",
+    "kundeservice",
+    "vare butikker",
 }
 
 # Generic path patterns that denote category pages rather than individual articles
@@ -42,6 +53,8 @@ CATEGORY_URL_PATTERNS = [
     r"^/(?:news|nyheter|category|arkiv|archive|presse|press)/?$",
     r"^/(?:news|nyheter|arkiv)/page/\d+/?$",
     r"^/(?:produkter|products|tjenester|services)/?$",
+    r"^/(?:finn-butikk|butikker|stores|locations|apningstider|vare-butikker)/?.*",
+    r"^/(?:om-oss|om-bouvet|about-us|kontakt|kontakt-oss|contact|kundeservice|personvern|cookies)/?.*",
 ]
 
 
@@ -109,6 +122,31 @@ class NewsVerifier:
             return False
 
     @staticmethod
+    def find_rss_feed_urls(html: str, base_url: str) -> list[str]:
+        """Discover corporate RSS/Atom feed links from HTML header or body."""
+        feed_pattern = re.compile(
+            r'<link[^>]+(?:application/rss\+xml|application/atom\+xml)[^>]+href=[\'"]([^\'"]+)[\'"]',
+            re.IGNORECASE,
+        )
+        found = []
+        base_domain = urlparse(base_url).netloc.lower()
+        if base_domain.startswith("www."):
+            base_domain = base_domain[4:]
+
+        for match in feed_pattern.findall(html):
+            full = urljoin(base_url, match.strip())
+            parsed = urlparse(full)
+            host = parsed.netloc.lower()
+            if host.startswith("www."):
+                host = host[4:]
+            if host == base_domain:
+                if "/comments" in full.lower():
+                    continue
+                if full not in found:
+                    found.append(full)
+        return found
+
+    @staticmethod
     def find_news_section_url(html: str, base_url: str) -> Optional[str]:
         """Find the primary news or press releases section link from homepage HTML."""
         news_link_pattern = re.compile(
@@ -165,7 +203,7 @@ class NewsVerifier:
             link_el = item.find("link")
             pub_date_el = item.find("pubDate")
 
-            title = (title_el.text or "").strip() if title_el is not None else ""
+            title = html_lib.unescape((title_el.text or "").strip()) if title_el is not None else ""
             link = (link_el.text or "").strip() if link_el is not None else ""
             pub_date_raw = (pub_date_el.text or "").strip() if pub_date_el is not None else ""
 
@@ -216,7 +254,7 @@ class NewsVerifier:
                 for item in items:
                     item_type = item.get("@type", "")
                     if item_type in ("NewsArticle", "Article", "BlogPosting", "PressRelease"):
-                        title = str(item.get("headline") or item.get("name") or "").strip()
+                        title = html_lib.unescape(str(item.get("headline") or item.get("name") or "").strip())
                         raw_url = str(item.get("url") or item.get("mainEntityOfPage") or base_url).strip()
                         full_url = urljoin(base_url, raw_url)
                         raw_pub = str(item.get("datePublished") or "").strip()
@@ -253,7 +291,7 @@ class NewsVerifier:
             og_url_m = re.search(r'<meta[^>]+property=[\'"]og:url[\'"][^>]+content=[\'"]([^\'"]+)[\'"]', html, re.IGNORECASE)
 
             if og_title_m and og_date_m:
-                title = og_title_m.group(1).strip()
+                title = html_lib.unescape(og_title_m.group(1).strip())
                 raw_date = og_date_m.group(1).strip()
                 raw_url = og_url_m.group(1).strip() if og_url_m else base_url
                 full_url = urljoin(base_url, raw_url)
@@ -276,5 +314,41 @@ class NewsVerifier:
                             is_duplicate=False,
                         )
                     )
+
+        # 3. Search semantic HTML <article> tags containing title link and <time datetime="...">
+        if not articles:
+            article_blocks = re.findall(r'<article[^>]*>(.*?)</article>', html, re.DOTALL | re.IGNORECASE)
+            for block in article_blocks:
+                time_m = re.search(r'<time[^>]+datetime=[\'"]([^\'"]+)[\'"]', block, re.IGNORECASE)
+                link_m = re.search(r'<a[^>]+href=[\'"]([^\'"]+)[\'"][^>]*>(.*?)</a>', block, re.DOTALL | re.IGNORECASE)
+                if time_m and link_m:
+                    raw_pub = time_m.group(1).strip()
+                    raw_url = link_m.group(1).strip()
+                    raw_title = re.sub(r'<[^>]+>', '', link_m.group(2)).strip()
+                    raw_title = html_lib.unescape(re.sub(r'\s+', ' ', raw_title).strip())
+                    pub_date = self.parse_iso_date(raw_pub)
+                    full_url = urljoin(base_url, raw_url)
+
+                    if (
+                        raw_title
+                        and pub_date
+                        and not self.is_navigation_label(raw_title)
+                        and not self.is_homepage_url(full_url, base_url)
+                        and not self.is_category_url(full_url)
+                    ):
+                        t_hash = self.compute_title_hash(raw_title)
+                        if t_hash not in seen_titles:
+                            seen_titles.add(t_hash)
+                            articles.append(
+                                NewsArticle(
+                                    title=raw_title,
+                                    article_url=full_url,
+                                    source=effective_source,
+                                    publication_date=pub_date,
+                                    retrieval_date=utc_now(),
+                                    evidence_span=f"Verified semantic HTML article date '{pub_date}' for '{raw_title}'.",
+                                    is_duplicate=False,
+                                )
+                            )
 
         return articles

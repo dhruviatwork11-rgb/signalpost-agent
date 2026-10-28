@@ -857,3 +857,150 @@ def test_website_discovery_for_missing_registry_urls():
     assert "886581432" in vw.evidence_span or "886 581 432" in vw.evidence_span
 
 
+def test_job_employer_mismatch_rejection_voith_hydro():
+    """Verify that a distinct company with partial token overlap (Voith Hydro) is rejected for Norsk Hydro."""
+    assert JobVerifier.verify_employer_match("VOITH HYDRO AS AVD FREDRIKSTAD", "NORSK HYDRO ASA") is False
+    assert JobVerifier.verify_employer_match("NORSK HYDRO ENERGI AS", "NORSK HYDRO ASA") is True
+    assert JobVerifier.verify_employer_match("HYDRO REIN AS", "NORSK HYDRO ASA") is True
+    assert JobVerifier.verify_employer_match("SIEMENS ENERGY AS", "EQUINOR ASA") is False
+
+
+def test_job_rate_limited_blocked_state():
+    """Verify that HTTP 429 returns blocked status and builds a blocked availability claim."""
+    class MockRateLimitedClient:
+        def get(self, url, headers=None):
+            return httpx.Response(429, request=httpx.Request("GET", url))
+
+    verifier = JobVerifier(http_client=MockRateLimitedClient())
+    postings = verifier.fetch_nav_vacancies("TELENOR ASA", "982463718")
+    assert postings.status == "blocked"
+    assert len(postings) == 0
+
+    profile = CompanyProfile(
+        org_nr="982463718",
+        name="TELENOR ASA",
+        job_postings=postings,
+        job_search_status="blocked",
+    )
+    evidence = SourceEvidence(
+        source_name="Enhetsregisteret",
+        source_url="https://data.brreg.no/enhetsregisteret/api/enheter/982463718",
+        response_hash="hash123",
+    )
+    envelope = build_terminal_envelope(
+        org_nr="982463718",
+        run_id="test-blocked",
+        started_at=utc_now(),
+        completed_at=utc_now(),
+        profile=profile,
+        evidence=evidence,
+    )
+    claims = {c["field"]: c for c in envelope["claims"]}
+    assert claims["job_postings"]["availability"] == "blocked"
+    assert claims["job_postings"]["value"] is None
+    assert claims["job_postings"]["confidence"] == 0.0
+
+
+def test_news_rss_feed_link_extraction():
+    """Verify that corporate RSS feed links are discovered from HTML header."""
+    html = """<!DOCTYPE html>
+    <html>
+    <head>
+        <link rel="alternate" type="application/rss+xml" title="Bouvet deler" href="https://www.bouvet.no/bouvet-deler/rss" />
+        <link rel="alternate" type="application/rss+xml" title="Comments" href="https://www.bouvet.no/comments/feed" />
+        <link rel="alternate" type="application/rss+xml" title="External" href="https://othercompany.com/feed" />
+    </head>
+    <body>Welcome</body>
+    </html>
+    """
+    feeds = NewsVerifier.find_rss_feed_urls(html, "https://www.bouvet.no/")
+    assert feeds == ["https://www.bouvet.no/bouvet-deler/rss"]
+
+
+def test_news_semantic_time_tag_extraction():
+    """Verify that semantic HTML article cards with <time datetime="..."> are extracted."""
+    html = """<!DOCTYPE html>
+    <html>
+    <body>
+        <article class="news-item">
+            <h2><a href="/nyheter/stromnettet-oppgraderes">Statnett oppgraderer kraftnettet i Innlandet</a></h2>
+            <time datetime="2026-10-26 12:01:27Z">26. oktober 2026</time>
+        </article>
+    </body>
+    </html>
+    """
+    verifier = NewsVerifier()
+    articles = verifier.extract_from_html(html, "https://www.statnett.no/nyheter")
+    assert len(articles) == 1
+    assert articles[0].title == "Statnett oppgraderer kraftnettet i Innlandet"
+    assert articles[0].publication_date == "2026-10-26"
+    assert articles[0].article_url == "https://www.statnett.no/nyheter/stromnettet-oppgraderes"
+
+
+def test_news_not_applicable_when_no_website():
+    """Verify that companies without a verified website report news as not_applicable."""
+    profile = CompanyProfile(
+        org_nr="988775460",
+        name="RØDSKIFERVEIEN INVEST AS",
+        verified_website=None,
+        news_search_status="not_applicable",
+    )
+    evidence = SourceEvidence(
+        source_name="Enhetsregisteret",
+        source_url="https://data.brreg.no/enhetsregisteret/api/enheter/988775460",
+        response_hash="hash123",
+    )
+    envelope = build_terminal_envelope(
+        org_nr="988775460",
+        run_id="test-na",
+        started_at=utc_now(),
+        completed_at=utc_now(),
+        profile=profile,
+        evidence=evidence,
+    )
+    claims = {c["field"]: c for c in envelope["claims"]}
+    assert claims["news_articles"]["availability"] == "not_applicable"
+    assert claims["news_articles"]["value"] is None
+
+
+def test_news_reject_store_locator_and_opening_hours():
+    """Verify that operational store-locator pages (e.g. /finn-butikk) and generic titles are rejected."""
+    html = """<!DOCTYPE html>
+    <html>
+    <body>
+        <article class="store-item">
+            <h2><a href="/finn-butikk">Alle butikker og åpningstider</a></h2>
+            <time datetime="2026-11-04">4. november 2026</time>
+        </article>
+    </body>
+    </html>
+    """
+    verifier = NewsVerifier()
+    articles = verifier.extract_from_html(html, "https://www.vinmonopolet.no")
+    assert len(articles) == 0
+
+
+def test_news_rss_feed_html_entity_unescaping():
+    """Verify that HTML entities in news titles are properly unescaped."""
+    rss = """<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0">
+        <channel>
+            <title>Statnett Pressemeldinger</title>
+            <link>https://www.statnett.no</link>
+            <item>
+                <title>Statnett planlegger en ny str&#xF8;mforbindelse p&#xE5; Hadeland</title>
+                <link>https://www.statnett.no/nyheter/stromforbindelse</link>
+                <pubDate>Mon, 26 Oct 2026 12:00:00 GMT</pubDate>
+            </item>
+        </channel>
+    </rss>
+    """
+    verifier = NewsVerifier()
+    articles = verifier.extract_from_rss(rss, "statnett.no")
+    assert len(articles) == 1
+    assert articles[0].title == "Statnett planlegger en ny strømforbindelse på Hadeland"
+    assert articles[0].publication_date == "2026-10-26"
+
+
+
+
