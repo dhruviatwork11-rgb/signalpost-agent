@@ -222,6 +222,73 @@ class WebsiteVerifier:
                 if vw.is_verified and vw.final_url:
                     vw.evidence_span = f"Discovered and verified domain {vw.final_url} for {legal_name}: {vw.evidence_span}"
                     return vw
+
+                # If root page is ambiguous (reachable but lacks proof), inspect candidate sub-pages
+                if (
+                    vw.final_url
+                    and not vw.is_verified
+                    and not vw.is_parent_or_group
+                    and vw.verification_status == "ambiguous"
+                ):
+                    parsed = urlparse(vw.final_url)
+                    base_origin = f"{parsed.scheme}://{parsed.netloc}"
+                    candidate_sub_paths = [
+                        "/kontakt",
+                        "/kontakt-oss",
+                        "/investor",
+                        "/en/investor-relations",
+                        "/om-oss",
+                        "/om-selskapet",
+                    ]
+                    headers = {
+                        "User-Agent": self.user_agent,
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    }
+                    spaced_org = f"{org_nr[:3]}\\s*{org_nr[3:6]}\\s*{org_nr[6:]}"
+                    org_pattern = re.compile(
+                        rf"\b(?:org\.?(?:nr|nummer)?[:.]?\s*)?({spaced_org})\b",
+                        re.IGNORECASE,
+                    )
+
+                    for sub_path in candidate_sub_paths:
+                        sub_url = f"{base_origin}{sub_path}"
+                        try:
+                            if self._http_client is not None:
+                                sub_resp = self._http_client.get(
+                                    sub_url, headers=headers, follow_redirects=True
+                                )
+                            else:
+                                with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
+                                    sub_resp = client.get(sub_url, headers=headers)
+                            if sub_resp.status_code >= 400:
+                                continue
+
+                            sub_text = sub_resp.text[:524288]
+                            sub_domain = self.extract_domain(str(sub_resp.url))
+                            if sub_domain != host:
+                                continue
+
+                            sub_org_match = org_pattern.search(sub_text)
+                            sub_name_found = clean_legal.lower() in sub_text.lower()
+
+                            if sub_org_match:
+                                span_start = max(0, sub_org_match.start() - 30)
+                                span_end = min(len(sub_text), sub_org_match.end() + 30)
+                                snippet = re.sub(
+                                    r"\s+", " ", sub_text[span_start:span_end]
+                                ).strip()
+                                vw.is_verified = True
+                                vw.verification_status = "verified"
+                                vw.evidence_span = f"Discovered domain {vw.final_url} and verified organisation number {org_nr} on {sub_resp.url}: '{snippet}'"
+                                return vw
+
+                            if sub_name_found:
+                                vw.is_verified = True
+                                vw.verification_status = "verified"
+                                vw.evidence_span = f"Discovered domain {vw.final_url} and verified exact legal entity name '{clean_legal}' on {sub_resp.url}."
+                                return vw
+                        except Exception:
+                            continue
             except Exception:
                 continue
 

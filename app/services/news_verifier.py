@@ -150,7 +150,7 @@ class NewsVerifier:
     def find_news_section_url(html: str, base_url: str) -> Optional[str]:
         """Find the primary news or press releases section link from homepage HTML."""
         news_link_pattern = re.compile(
-            r'href=[\'"]([^\'"]*(?:/nyheter|/news|/presse|/aktuelt|/press-releases|/media/news)[^\'"]*)[\'"]',
+            r'href=[\'"]([^\'"]*(?:/nyheter|/news|/presse|/pressemeldinger|/aktuelt|/press-releases|/news-and-media|/media/news|/media/press-releases|/siste-nytt)[^\'"]*)[\'"]',
             re.IGNORECASE,
         )
         matches = news_link_pattern.findall(html)
@@ -165,7 +165,8 @@ class NewsVerifier:
                 host = host[4:]
             if host == base_domain:
                 if not any(token in full_url.lower() for token in ["login", "search", "#"]):
-                    return full_url
+                    if not any(token in full_url.lower() for token in ["finn-butikk", "butikker", "karriere", "careers"]):
+                        return full_url
         return None
 
     @staticmethod

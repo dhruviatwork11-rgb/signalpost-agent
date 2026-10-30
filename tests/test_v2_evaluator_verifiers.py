@@ -1002,5 +1002,220 @@ def test_news_rss_feed_html_entity_unescaping():
     assert articles[0].publication_date == "2026-10-26"
 
 
+# --- G. Version 2.3 Improvements: Cache, Sub-page Verification, & News Archive Tests ---
+
+def test_job_search_cache_hit_and_miss(tmp_path):
+    """Verify that NAV job search results are persisted in SQLite and served on subsequent lookups."""
+    from app.services.database import DatabaseService
+
+    db = DatabaseService(tmp_path / "cache_test.db")
+    
+    mock_payload = {
+        "hits": {
+            "hits": [
+                {
+                    "_source": {
+                        "uuid": "test-uuid-123",
+                        "title": "Senior Cloud Engineer",
+                        "status": "ACTIVE",
+                        "businessName": "Telenor ASA",
+                        "employer": {"name": "Telenor ASA"},
+                        "locationList": [{"city": "Fornebu", "municipal": "Bærum"}],
+                        "published": "2026-10-20T10:00:00Z",
+                        "expires": "2026-11-20T10:00:00Z",
+                    }
+                }
+            ]
+        }
+    }
+
+    call_count = 0
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(200, json=mock_payload, request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(mock_handler))
+    verifier = JobVerifier(http_client=client, db=db, cache_ttl_seconds=3600)
+
+    # First call: cache miss, triggers HTTP call
+    res1 = verifier.fetch_nav_vacancies(legal_name="TELENOR ASA", org_nr="976967631")
+    assert res1.status == "completed"
+    assert len(res1) == 1
+    assert res1[0].job_title == "Senior Cloud Engineer"
+    assert call_count == 1
+
+    # Second call: cache hit, served directly from SQLite without network call
+    res2 = verifier.fetch_nav_vacancies(legal_name="TELENOR ASA", org_nr="976967631")
+    assert res2.status == "completed"
+    assert len(res2) == 1
+    assert res2[0].job_title == "Senior Cloud Engineer"
+    assert call_count == 1  # No additional network call!
+
+
+def test_job_search_cache_expiry(tmp_path):
+    """Verify that expired cache entries are discarded and re-fetched."""
+    from app.services.database import DatabaseService
+
+    db = DatabaseService(tmp_path / "cache_exp_test.db")
+
+    # Insert an expired entry directly into SQLite
+    db.set_job_search_cache(
+        cache_key="976967631",
+        org_nr="976967631",
+        legal_name="TELENOR ASA",
+        search_status="completed",
+        vacancies=[{"job_title": "Old Job", "employer_name": "Telenor ASA", "advertisement_url": "https://ad.no"}],
+        retrieved_at="2026-10-01T00:00:00Z",
+        expires_at="2026-10-02T00:00:00Z",  # In the past
+    )
+
+    call_count = 0
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(200, json={"hits": {"hits": []}}, request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(mock_handler))
+    verifier = JobVerifier(http_client=client, db=db, cache_ttl_seconds=3600)
+
+    # Should detect expired entry, return None from cache, and execute network query (for both terms when 0 hits)
+    res = verifier.fetch_nav_vacancies(legal_name="TELENOR ASA", org_nr="976967631")
+    assert res.status == "completed"
+    assert len(res) == 0
+    assert call_count >= 1
+
+
+def test_job_search_never_caches_blocked_or_failed(tmp_path):
+    """Verify that HTTP 429 blocked or network error states are NEVER saved into the cache as successful."""
+    from app.services.database import DatabaseService
+
+    db = DatabaseService(tmp_path / "cache_blocked_test.db")
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "1"}, request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(mock_handler))
+    verifier = JobVerifier(http_client=client, db=db, cache_ttl_seconds=3600)
+
+    res = verifier.fetch_nav_vacancies(legal_name="EQUINOR ASA", org_nr="923609016")
+    assert res.status == "blocked"
+
+    # Verify database has NO cached entry for this org_nr
+    cached = db.get_job_search_cache("923609016")
+    assert cached is None
+
+
+def test_job_search_cache_corruption_resilience(tmp_path):
+    """Verify that corrupt JSON in SQLite cache does not crash job verification."""
+    from app.services.database import DatabaseService
+
+    db = DatabaseService(tmp_path / "cache_corrupt_test.db")
+    conn = db.get_connection()
+    with conn:
+        conn.cursor().execute(
+            """
+            INSERT INTO job_search_cache (
+                cache_key, org_nr, legal_name, search_status, vacancies_json,
+                retrieved_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("923609016", "923609016", "EQUINOR ASA", "completed", "NOT_JSON{{{", "2026-10-20T00:00:00Z", "2099-01-01T00:00:00Z"),
+        )
+    conn.close()
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"hits": {"hits": []}}, request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(mock_handler))
+    verifier = JobVerifier(http_client=client, db=db)
+
+    # Should not raise exception
+    res = verifier.fetch_nav_vacancies(legal_name="EQUINOR ASA", org_nr="923609016")
+    assert res.status == "completed"
+
+
+def test_job_rate_limit_retry_after_handling():
+    """Verify that Retry-After header is parsed and bounded when rate limited."""
+    attempts = 0
+    hit_payload = {
+        "hits": {
+            "hits": [
+                {
+                    "_source": {
+                        "uuid": "bouvet-1",
+                        "title": "Konsulent",
+                        "status": "ACTIVE",
+                        "employer": {"name": "Bouvet ASA"},
+                        "locationList": [{"city": "Oslo"}],
+                    }
+                }
+            ]
+        }
+    }
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(429, headers={"Retry-After": "1"}, request=request)
+        return httpx.Response(200, json=hit_payload, request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(mock_handler))
+    verifier = JobVerifier(http_client=client)
+
+    res = verifier.fetch_nav_vacancies(legal_name="BOUVET ASA", org_nr="982363062")
+    assert attempts == 2
+    assert res.status == "completed"
+    assert len(res) == 1
+    assert res[0].job_title == "Konsulent"
+
+
+def test_website_discovery_subpage_verification_veidekke_storebrand():
+    """
+    Verify that when candidate domain homepage omits legal suffix 'ASA' (ambiguous),
+    deeper inspection of /kontakt or /investor sub-pages recovers exact legal name or org nr.
+    """
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        url_str = str(request.url)
+        if url_str == "https://www.veidekke.no" or url_str == "https://www.veidekke.no/":
+            # Homepage has brand "Veidekke" but lacks "Veidekke ASA" or org nr
+            return httpx.Response(200, text="<html><body><h1>Veidekke</h1><p>Bygger fremtiden</p></body></html>", request=request)
+        elif "/kontakt" in url_str:
+            # /kontakt has exact full legal name and org number
+            return httpx.Response(200, text="<html><body><h1>Kontakt oss</h1><p>Veidekke ASA</p><p>Org.nr. 921 785 410</p></body></html>", request=request)
+        return httpx.Response(404, request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(mock_handler))
+    verifier = WebsiteVerifier(http_client=client)
+
+    vw = verifier.discover_candidate_domain(legal_name="VEIDEKKE ASA", org_nr="921785410")
+    assert vw is not None
+    assert vw.is_verified is True
+    assert vw.verification_status == "verified"
+    assert "921785410" in vw.evidence_span or "VEIDEKKE ASA" in vw.evidence_span
+
+
+def test_news_section_expanded_paths_and_subpage_rss():
+    """Verify that find_news_section_url recognizes Norwegian corporate press paths and rejects store locators."""
+    verifier = NewsVerifier()
+    
+    html = """
+    <html>
+    <body>
+        <a href="/media/pressemeldinger/">Pressemeldinger</a>
+        <a href="/finn-butikk">Finn butikk</a>
+        <a href="/karriere">Karriere</a>
+    </body>
+    </html>
+    """
+    found_url = verifier.find_news_section_url(html, "https://www.orkla.no")
+    assert found_url == "https://www.orkla.no/media/pressemeldinger/"
+
+    # Store locator and opening hours are rejected
+    store_locator_html = '<a href="/finn-butikk/oslo">Finn butikk</a>'
+    assert verifier.find_news_section_url(store_locator_html, "https://www.vinmonopolet.no") is None
+
+
+
 
 

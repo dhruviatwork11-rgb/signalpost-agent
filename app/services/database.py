@@ -117,6 +117,20 @@ def init_db(db_path: Path | str) -> None:
                     FOREIGN KEY (org_nr) REFERENCES companies (org_nr) ON DELETE CASCADE
                 );
                 CREATE INDEX IF NOT EXISTS idx_assets_org ON verified_assets (org_nr, asset_type);
+
+                -- Persistent cache for public employment register (NAV Arbeidsplassen)
+                CREATE TABLE IF NOT EXISTS job_search_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    org_nr TEXT NOT NULL,
+                    legal_name TEXT NOT NULL,
+                    search_status TEXT NOT NULL,
+                    vacancies_json TEXT NOT NULL,
+                    retrieved_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    search_url TEXT,
+                    query_term TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_job_cache_org ON job_search_cache (org_nr);
                 """
             )
             # Automatic schema migration for existing databases
@@ -607,5 +621,95 @@ class DatabaseService:
                 }
                 for r in rows
             ]
+        finally:
+            conn.close()
+
+    def get_job_search_cache(
+        self, cache_key: str, now_iso: Optional[str] = None
+    ) -> Optional[dict[str, Any]]:
+        """
+        Fetch cached NAV job search results if not expired.
+        Returns dict with vacancies and search status, or None if miss/expired.
+        Thread-safe and fails gracefully on database errors.
+        """
+        now_val = now_iso or utc_now().isoformat()
+        conn = self.get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT cache_key, org_nr, legal_name, search_status, vacancies_json,
+                       retrieved_at, expires_at, search_url, query_term
+                FROM job_search_cache
+                WHERE cache_key = ? AND expires_at > ?
+                """,
+                (cache_key, now_val),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+
+            try:
+                vacancies = json.loads(row["vacancies_json"])
+            except Exception:
+                return None
+
+            return {
+                "cache_key": row["cache_key"],
+                "org_nr": row["org_nr"],
+                "legal_name": row["legal_name"],
+                "search_status": row["search_status"],
+                "vacancies": vacancies,
+                "retrieved_at": row["retrieved_at"],
+                "expires_at": row["expires_at"],
+                "search_url": row["search_url"],
+                "query_term": row["query_term"],
+            }
+        except Exception:
+            return None
+        finally:
+            conn.close()
+
+    def set_job_search_cache(
+        self,
+        cache_key: str,
+        org_nr: str,
+        legal_name: str,
+        search_status: str,
+        vacancies: list[dict[str, Any]],
+        retrieved_at: str,
+        expires_at: str,
+        search_url: Optional[str] = None,
+        query_term: Optional[str] = None,
+    ) -> None:
+        """
+        Upsert NAV job search results into the persistent cache.
+        Thread-safe and fails gracefully without raising.
+        """
+        conn = self.get_connection()
+        try:
+            with conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT OR REPLACE INTO job_search_cache (
+                        cache_key, org_nr, legal_name, search_status,
+                        vacancies_json, retrieved_at, expires_at, search_url, query_term
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        cache_key,
+                        org_nr,
+                        legal_name,
+                        search_status,
+                        json.dumps(vacancies),
+                        retrieved_at,
+                        expires_at,
+                        search_url,
+                        query_term,
+                    ),
+                )
+        except Exception:
+            pass
         finally:
             conn.close()

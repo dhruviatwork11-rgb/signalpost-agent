@@ -1,6 +1,6 @@
 """Service for discovering and verifying individual job advertisements from official sources."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import json
 import re
 import threading
@@ -55,11 +55,15 @@ class JobVerifier:
         timeout: float = 6.0,
         user_agent: str = USER_AGENT,
         http_client: Optional[httpx.Client] = None,
+        db: Optional[Any] = None,
+        cache_ttl_seconds: int = 86400,
     ):
         self.base_api_url = base_api_url
         self.timeout = timeout
         self.user_agent = user_agent
         self._http_client = http_client
+        self.db = db
+        self.cache_ttl_seconds = cache_ttl_seconds
 
     def _execute_request(self, url: str, headers: dict[str, str]) -> tuple[Optional[httpx.Response], Optional[str]]:
         """Pace requests to NAV Arbeidsplassen public API with inter-thread rate limiting."""
@@ -152,6 +156,28 @@ class JobVerifier:
         Returns a JobPostingList preserving search status (completed, blocked, or failed).
         """
         clean_legal = re.sub(r"\s+", " ", legal_name).strip()
+        cache_key = org_nr.strip()
+
+        # Check persistent cache if database service is provided
+        if self.db is not None:
+            try:
+                cached = self.db.get_job_search_cache(cache_key)
+                if cached is not None and cached.get("search_status") == "completed":
+                    cached_postings = []
+                    for v in cached.get("vacancies", []):
+                        try:
+                            cached_postings.append(JobPosting.model_validate(v))
+                        except Exception:
+                            pass
+                    return JobPostingList(
+                        cached_postings[:max_results],
+                        status="completed",
+                        search_url=cached.get("search_url") or self.base_api_url,
+                        query_term=cached.get("query_term") or clean_legal,
+                        error_message=None,
+                    )
+            except Exception:
+                pass
 
         # Extract normalized company name without corporate form suffix
         base_name = re.sub(
@@ -198,8 +224,16 @@ class JobVerifier:
 
             if response.status_code == 429:
                 search_status = "blocked"
-                # Conservative retry with backoff if rate limited
-                time.sleep(2.0)
+                # Conservative retry with backoff honoring Retry-After if provided
+                backoff = 2.0
+                retry_header = response.headers.get("Retry-After")
+                if retry_header:
+                    try:
+                        parsed_wait = float(retry_header.strip())
+                        backoff = min(max(parsed_wait, 1.0), 5.0)
+                    except Exception:
+                        backoff = 2.0
+                time.sleep(backoff)
                 response, err = self._execute_request(url, headers)
                 if response and response.status_code == 200:
                     search_status = "completed"
@@ -304,6 +338,27 @@ class JobVerifier:
 
             if len(postings) >= max_results:
                 break
+
+        # Persistent cache update: only cache successfully completed searches
+        if self.db is not None and search_status == "completed":
+            try:
+                now_dt = utc_now()
+                retrieved_at_iso = now_dt.isoformat()
+                expires_at_iso = (now_dt + timedelta(seconds=self.cache_ttl_seconds)).isoformat()
+                vacancies_dicts = [p.model_dump(mode="json") for p in postings]
+                self.db.set_job_search_cache(
+                    cache_key=cache_key,
+                    org_nr=cache_key,
+                    legal_name=legal_name,
+                    search_status="completed",
+                    vacancies=vacancies_dicts,
+                    retrieved_at=retrieved_at_iso,
+                    expires_at=expires_at_iso,
+                    search_url=last_search_url or self.base_api_url,
+                    query_term=effective_term,
+                )
+            except Exception:
+                pass
 
         return JobPostingList(
             postings,

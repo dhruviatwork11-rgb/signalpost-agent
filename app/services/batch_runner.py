@@ -471,7 +471,7 @@ class BatchRunner:
         self.social_verifier = social_verifier or SocialVerifier()
         self.news_verifier = news_verifier or NewsVerifier()
         self.job_verifier = job_verifier or JobVerifier(
-            timeout=min(timeout, 5.0), http_client=injected_http
+            timeout=min(timeout, 5.0), http_client=injected_http, db=self.db
         )
         self.workers = max(1, min(workers, 8))  # Bounded concurrency
         self.verify_extended_assets = verify_extended_assets
@@ -599,12 +599,33 @@ class BatchRunner:
                                         with httpx.Client(timeout=4.0, follow_redirects=True) as client:
                                             resp = client.get(news_sub_url, headers=headers)
                                     if resp.status_code < 400:
-                                        sub_articles = self.news_verifier.extract_from_html(
+                                        # Check for RSS feeds on news sub-page
+                                        sub_feeds = self.news_verifier.find_rss_feed_urls(
                                             html=resp.text[:524288],
                                             base_url=news_sub_url,
-                                            source_domain=src_domain,
                                         )
-                                        articles.extend(sub_articles)
+                                        for sf_url in sub_feeds[:2]:
+                                            try:
+                                                if self.website_verifier._http_client is not None:
+                                                    sf_resp = self.website_verifier._http_client.get(sf_url, headers=headers)
+                                                else:
+                                                    with httpx.Client(timeout=4.0, follow_redirects=True) as client:
+                                                        sf_resp = client.get(sf_url, headers=headers)
+                                                if sf_resp.status_code == 200:
+                                                    feed_arts = self.news_verifier.extract_from_rss(sf_resp.text, src_domain)
+                                                    articles.extend(feed_arts)
+                                            except Exception:
+                                                pass
+                                            if articles:
+                                                break
+
+                                        if not articles:
+                                            sub_articles = self.news_verifier.extract_from_html(
+                                                html=resp.text[:524288],
+                                                base_url=news_sub_url,
+                                                source_domain=src_domain,
+                                            )
+                                            articles.extend(sub_articles)
                                 except Exception:
                                     pass
 
