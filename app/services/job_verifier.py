@@ -47,7 +47,7 @@ class JobVerifier:
 
     _lock = threading.Lock()
     _last_request_ts = 0.0
-    _min_request_interval = 1.1  # Seconds between requests to live Arbeidsplassen endpoint
+    _min_request_interval = 1.2  # Seconds after completion before next request starts
 
     def __init__(
         self,
@@ -66,14 +66,26 @@ class JobVerifier:
         self.cache_ttl_seconds = cache_ttl_seconds
 
     def _execute_request(self, url: str, headers: dict[str, str]) -> tuple[Optional[httpx.Response], Optional[str]]:
-        """Pace requests to NAV Arbeidsplassen public API with inter-thread rate limiting."""
-        if "arbeidsplassen.nav.no" in url and self._http_client is None:
+        """Pace requests to NAV Arbeidsplassen public API with dedicated inter-thread serialized rate limiting."""
+        is_nav = "arbeidsplassen.nav.no" in url
+
+        if is_nav:
             with JobVerifier._lock:
                 now = time.monotonic()
                 elapsed = now - JobVerifier._last_request_ts
                 if elapsed < JobVerifier._min_request_interval:
                     time.sleep(JobVerifier._min_request_interval - elapsed)
-                JobVerifier._last_request_ts = time.monotonic()
+                try:
+                    if self._http_client is not None:
+                        response = self._http_client.get(url, headers=headers)
+                    else:
+                        with httpx.Client(timeout=self.timeout) as client:
+                            response = client.get(url, headers=headers)
+                    return response, None
+                except Exception as exc:
+                    return None, str(exc)
+                finally:
+                    JobVerifier._last_request_ts = time.monotonic()
 
         try:
             if self._http_client is not None:
@@ -143,6 +155,13 @@ class JobVerifier:
 
         return False
 
+    @staticmethod
+    def build_cache_key(org_nr: str, legal_name: str, max_results: int = 5) -> str:
+        """Construct unambiguous compound cache key combining org number, normalized name, and query bounds."""
+        clean_org = re.sub(r"\D", "", org_nr).strip()
+        clean_name = re.sub(r"[^\w]+", "_", legal_name.lower()).strip("_")
+        return f"{clean_org}:{clean_name}:max_{max_results}"
+
     def fetch_nav_vacancies(
         self,
         legal_name: str,
@@ -156,26 +175,64 @@ class JobVerifier:
         Returns a JobPostingList preserving search status (completed, blocked, or failed).
         """
         clean_legal = re.sub(r"\s+", " ", legal_name).strip()
-        cache_key = org_nr.strip()
+        clean_org = re.sub(r"\D", "", org_nr).strip()
+        cache_key = self.build_cache_key(clean_org, clean_legal, max_results)
 
-        # Check persistent cache if database service is provided
+        # 1. Check persistent cache if database service is provided
         if self.db is not None:
             try:
                 cached = self.db.get_job_search_cache(cache_key)
+
+                # Fallback check for legacy single-key records if compound key not found
+                legacy_key = clean_org
+                if cached is None and legacy_key != cache_key:
+                    legacy_cached = self.db.get_job_search_cache(legacy_key)
+                    if legacy_cached is not None:
+                        # Verify that legacy record actually belongs to this company name
+                        l_name = legacy_cached.get("legal_name", "")
+                        if self.verify_employer_match(l_name, clean_legal):
+                            cached = legacy_cached
+                        else:
+                            # Invalidate mismatched legacy entry to prevent cache pollution
+                            self.db.invalidate_job_search_cache(legacy_key)
+
                 if cached is not None and cached.get("search_status") == "completed":
-                    cached_postings = []
-                    for v in cached.get("vacancies", []):
-                        try:
-                            cached_postings.append(JobPosting.model_validate(v))
-                        except Exception:
-                            pass
-                    return JobPostingList(
-                        cached_postings[:max_results],
-                        status="completed",
-                        search_url=cached.get("search_url") or self.base_api_url,
-                        query_term=cached.get("query_term") or clean_legal,
-                        error_message=None,
-                    )
+                    # Deep verification of all cached vacancies against target company identity
+                    is_valid = True
+                    cached_postings: list[JobPosting] = []
+                    c_org = cached.get("org_nr", "")
+                    c_name = cached.get("legal_name", "")
+
+                    # Verify entity match between cached record and target
+                    if c_org != clean_org and not self.verify_employer_match(c_name, clean_legal):
+                        is_valid = False
+
+                    if is_valid:
+                        for v in cached.get("vacancies", []):
+                            try:
+                                posting = JobPosting.model_validate(v)
+                                # Strict employer match verification for every single vacancy
+                                if not self.verify_employer_match(posting.employer_name, clean_legal):
+                                    is_valid = False
+                                    break
+                                cached_postings.append(posting)
+                            except Exception:
+                                is_valid = False
+                                break
+
+                    if is_valid:
+                        return JobPostingList(
+                            cached_postings[:max_results],
+                            status="completed",
+                            search_url=cached.get("search_url") or self.base_api_url,
+                            query_term=cached.get("query_term") or clean_legal,
+                            error_message=None,
+                        )
+                    else:
+                        # Tainted or mismatched cache record: invalidate and purge
+                        self.db.invalidate_job_search_cache(cache_key)
+                        if legacy_key != cache_key:
+                            self.db.invalidate_job_search_cache(legacy_key)
             except Exception:
                 pass
 
@@ -348,8 +405,8 @@ class JobVerifier:
                 vacancies_dicts = [p.model_dump(mode="json") for p in postings]
                 self.db.set_job_search_cache(
                     cache_key=cache_key,
-                    org_nr=cache_key,
-                    legal_name=legal_name,
+                    org_nr=clean_org,
+                    legal_name=clean_legal,
                     search_status="completed",
                     vacancies=vacancies_dicts,
                     retrieved_at=retrieved_at_iso,

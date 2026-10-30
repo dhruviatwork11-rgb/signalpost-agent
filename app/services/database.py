@@ -713,3 +713,21 @@ class DatabaseService:
             pass
         finally:
             conn.close()
+
+    def invalidate_job_search_cache(self, cache_key: str) -> None:
+        """
+        Safely remove an invalidated, expired, or tainted job search cache entry.
+        Thread-safe and fails gracefully without raising.
+        """
+        conn = self.get_connection()
+        try:
+            with conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "DELETE FROM job_search_cache WHERE cache_key = ?",
+                    (cache_key,),
+                )
+        except Exception:
+            pass
+        finally:
+            conn.close()

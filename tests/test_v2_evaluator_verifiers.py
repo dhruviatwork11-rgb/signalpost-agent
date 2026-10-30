@@ -28,6 +28,7 @@ from app.models import (
     utc_now,
 )
 from app.services.batch_runner import BatchRunner, build_terminal_envelope
+from app.services.database import DatabaseService
 from app.services.job_verifier import JobVerifier
 from app.services.news_verifier import NewsVerifier
 from app.services.social_verifier import SocialVerifier
@@ -1214,6 +1215,158 @@ def test_news_section_expanded_paths_and_subpage_rss():
     # Store locator and opening hours are rejected
     store_locator_html = '<a href="/finn-butikk/oslo">Finn butikk</a>'
     assert verifier.find_news_section_url(store_locator_html, "https://www.vinmonopolet.no") is None
+
+
+def test_v2_4_job_compound_cache_key_isolation(tmp_path):
+    """Verify that compound cache keys isolate distinct companies and prevent cross-entity leakage."""
+    db_file = tmp_path / "test_cache_v24.db"
+    db = DatabaseService(db_file)
+
+    key1 = JobVerifier.build_cache_key("913364006", "VOITH HYDRO AS", 5)
+    key2 = JobVerifier.build_cache_key("913364006", "NORSK HYDRO ASA", 5)
+    assert key1 != key2
+    assert "voith_hydro_as" in key1
+    assert "norsk_hydro_asa" in key2
+
+
+def test_v2_4_job_cache_reverification_and_invalidation(tmp_path):
+    """Verify that cached vacancies are re-verified against company identity and purged if mismatched."""
+    db_file = tmp_path / "test_cache_tainted.db"
+    db = DatabaseService(db_file)
+
+    # Pre-seed cache with a tainted record (vacancy for unrelated company)
+    cache_key = JobVerifier.build_cache_key("913364006", "NORSK HYDRO ASA", 5)
+    tainted_vacancies = [
+        {
+            "job_title": "Turbiningeniør",
+            "employer_name": "Voith Hydro AS",  # Mismatch!
+            "employer_org_nr": "913364006",
+            "advertisement_url": "https://arbeidsplassen.nav.no/stillinger/stilling/123",
+            "is_active": True,
+        }
+    ]
+    db.set_job_search_cache(
+        cache_key=cache_key,
+        org_nr="913364006",
+        legal_name="Norsk Hydro ASA",
+        search_status="completed",
+        vacancies=tainted_vacancies,
+        retrieved_at="2026-10-30T00:00:00+00:00",
+        expires_at="2026-10-31T00:00:00+00:00",
+        search_url="https://arbeidsplassen.nav.no/api",
+        query_term="Norsk Hydro",
+    )
+
+    # Empty mock HTTP response so live fallback returns zero vacancies
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"hits": {"hits": []}})
+
+    client = httpx.Client(transport=httpx.MockTransport(mock_handler))
+    verifier = JobVerifier(http_client=client, db=db)
+
+    # Calling fetch_nav_vacancies must reject the tainted cache entry and purge it
+    res = verifier.fetch_nav_vacancies(legal_name="Norsk Hydro ASA", org_nr="913364006")
+    assert len(res) == 0
+
+    # Cache entry must have been replaced with the clean live search results (0 vacancies, not tainted)
+    fresh_cache = db.get_job_search_cache(cache_key)
+    assert fresh_cache is not None
+    assert len(fresh_cache["vacancies"]) == 0
+
+
+def test_v2_4_norwegian_text_date_parsing():
+    """Verify robust parsing of Norwegian, English, and ISO dates to YYYY-MM-DD."""
+    parse = NewsVerifier.parse_norwegian_text_date
+    assert parse("23. oktober 2026") == "2026-10-23"
+    assert parse("October 28, 2026") == "2026-10-28"
+    assert parse("28 October 2026, 8:00") == "2026-10-28"
+    assert parse("13. oktober 2026 13:35") == "2026-10-13"
+    assert parse("15. mai 2026") == "2026-05-15"
+    assert parse("1. des. 2025") == "2025-12-01"
+    assert parse("30.09.2026") == "2026-09-30"
+    assert parse("2026-09-30T10:00:00.000Z") == "2026-09-30"
+    assert parse("not a date") is None
+    assert parse("") is None
+
+
+def test_v2_4_news_card_extraction_hydro_format():
+    """Verify card-level extraction for Hydro anchor-wrapped article cards."""
+    verifier = NewsVerifier()
+    html = """
+    <html><body>
+        <a href="/no-NO/media/news/2026/hydro-breaks-ground/" class="link">
+            <article>
+                <h2>Hydro breaks ground on new press</h2>
+                <p class="news-article__list-item-date">23. oktober 2026</p>
+            </article>
+        </a>
+    </body></html>
+    """
+    arts = verifier.extract_from_html(html, "https://www.hydro.com/no-NO/media/news/")
+    assert len(arts) == 1
+    assert arts[0].title == "Hydro breaks ground on new press"
+    assert arts[0].publication_date == "2026-10-23"
+    assert arts[0].article_url == "https://www.hydro.com/no-NO/media/news/2026/hydro-breaks-ground/"
+
+
+def test_v2_4_news_card_extraction_orkla_format():
+    """Verify card-level extraction for Orkla teaser cards with data-date attribute."""
+    verifier = NewsVerifier()
+    html = """
+    <html><body>
+        <a class="item" href="/media/press-releases/2026/orkla-buyback/" aria-label="Orkla ASA: Status share buyback">
+            <div data-date="2026-10-28T07:00:00.000Z" class="__created">28 October 2026</div>
+            <h3 class="__name">Orkla ASA: Status share buyback</h3>
+        </a>
+    </body></html>
+    """
+    arts = verifier.extract_from_html(html, "https://www.orkla.com/media/press-releases/")
+    assert len(arts) == 1
+    assert arts[0].title == "Orkla ASA: Status share buyback"
+    assert arts[0].publication_date == "2026-10-28"
+    assert arts[0].article_url == "https://www.orkla.com/media/press-releases/2026/orkla-buyback/"
+
+
+def test_v2_4_news_card_extraction_posten_mynewsdesk_format():
+    """Verify card-level extraction for Posten Bring MyNewsdesk panel stories."""
+    verifier = NewsVerifier()
+    html = """
+    <html><body>
+        <div class="panel__content story">
+            <h2 class="panel__heading">
+                <a class="panel__link" href="https://www.mynewsdesk.com/no/posten-bring/pressreleases/pakketerminal-3474177">
+                    Posten Bring åpner sin største pakketerminal
+                </a>
+            </h2>
+            <time class="panel__date" datetime="2026-10-13 13:35:08">13. oktober 2026 13:35</time>
+        </div>
+    </body></html>
+    """
+    arts = verifier.extract_from_html(html, "https://www.mynewsdesk.com/no/posten-bring")
+    assert len(arts) == 1
+    assert arts[0].title == "Posten Bring åpner sin største pakketerminal"
+    assert arts[0].publication_date == "2026-10-13"
+    assert arts[0].article_url == "https://www.mynewsdesk.com/no/posten-bring/pressreleases/pakketerminal-3474177"
+
+
+def test_v2_4_news_section_discovery_orkla_hydro_posten():
+    """Verify section URL discovery prioritizes press/news archives and detects hosted newsrooms."""
+    verifier = NewsVerifier()
+    # Posten with MyNewsdesk link
+    posten_html = '<a href="https://www.mynewsdesk.com/no/posten-bring">Presse</a>'
+    assert verifier.find_news_section_url(posten_html, "https://www.postenbring.no") == "https://www.mynewsdesk.com/no/posten-bring"
+
+    # Hydro with news archive and subscription link
+    hydro_html = """
+        <a href="/en/global/investors/news-subscription/">Subscription</a>
+        <a href="/en/global/media/news/">News Archive</a>
+    """
+    assert verifier.find_news_section_url(hydro_html, "https://www.hydro.com") == "https://www.hydro.com/en/global/media/news/"
+
+    # Orkla press releases
+    orkla_html = '<a href="/media/press-releases/">Press releases</a>'
+    assert verifier.find_news_section_url(orkla_html, "https://www.orkla.com") == "https://www.orkla.com/media/press-releases/"
+
 
 
 

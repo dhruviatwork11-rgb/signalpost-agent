@@ -304,6 +304,9 @@ def main() -> None:
         "--workers", "-w", type=int, default=4, help="Bounded worker concurrency (default 4, max 8)"
     )
     batch_parser.add_argument(
+        "--db", default=DATABASE_PATH, help=f"Path to SQLite database file (default: {DATABASE_PATH})"
+    )
+    batch_parser.add_argument(
         "--run-id", help="Optional identifier for the run"
     )
 
@@ -336,6 +339,7 @@ def main() -> None:
             report_path=args.report,
             workers=args.workers,
             run_id=args.run_id,
+            db_path=args.db,
         )
     elif args.command == "import-mock":
         exit_code = import_mock_data(Path(args.file))

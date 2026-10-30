@@ -57,9 +57,75 @@ CATEGORY_URL_PATTERNS = [
     r"^/(?:om-oss|om-bouvet|about-us|kontakt|kontakt-oss|contact|kundeservice|personvern|cookies)/?.*",
 ]
 
+# Norwegian and English month name mapping for textual publication dates
+NORWEGIAN_MONTHS = {
+    "januar": 1, "jan": 1, "january": 1,
+    "februar": 2, "feb": 2, "february": 2,
+    "mars": 3, "mar": 3, "march": 3,
+    "april": 4, "apr": 4,
+    "mai": 5, "may": 5,
+    "juni": 6, "jun": 6, "june": 6,
+    "juli": 7, "jul": 7, "july": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sep": 9, "sept": 9,
+    "oktober": 10, "okt": 10, "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "desember": 12, "des": 12, "december": 12, "dec": 12,
+}
+
 
 class NewsVerifier:
     """Extracts and verifies genuine company news articles with strict publication date enforcement."""
+
+    @staticmethod
+    def parse_norwegian_text_date(text: str) -> Optional[str]:
+        """
+        Parse textual, numeric Norwegian, or ISO dates into verified YYYY-MM-DD.
+        Supports Norwegian textual months (e.g. '23. oktober 2026', '15. mai 2026'),
+        English/international formats ('October 28, 2026', '28 October 2026'),
+        and numeric formats ('23.10.2026', '2026-09-30T10:00:00Z').
+        """
+        if not text:
+            return None
+        clean = text.strip()
+
+        # 1. ISO date: YYYY-MM-DD (with optional trailing time/timezone)
+        iso_m = re.search(r"(\d{4})-(\d{2})-(\d{2})(?:[T\s]|$)", clean)
+        if iso_m:
+            year, month, day = int(iso_m.group(1)), int(iso_m.group(2)), int(iso_m.group(3))
+            if 1990 <= year <= 2030 and 1 <= month <= 12 and 1 <= day <= 31:
+                return f"{year:04d}-{month:02d}-{day:02d}"
+
+        # 2. Day-first textual month: "23. oktober 2026", "28 October 2026", "5. mai 2026", "13. okt. 2026"
+        txt_m1 = re.search(r"\b(\d{1,2})\.?\s+([a-zA-ZæøåÆØÅ]{3,12})\.?\s+(\d{4})\b", clean)
+        if txt_m1:
+            day = int(txt_m1.group(1))
+            month_word = txt_m1.group(2).lower()
+            year = int(txt_m1.group(3))
+            month = NORWEGIAN_MONTHS.get(month_word)
+            if month and (1990 <= year <= 2030) and (1 <= day <= 31):
+                return f"{year:04d}-{month:02d}-{day:02d}"
+
+        # 3. Month-first textual format: "October 28, 2026", "Okt 28, 2026"
+        txt_m2 = re.search(r"\b([a-zA-ZæøåÆØÅ]{3,12})\.?\s+(\d{1,2}),?\s+(\d{4})\b", clean)
+        if txt_m2:
+            month_word = txt_m2.group(1).lower()
+            day = int(txt_m2.group(2))
+            year = int(txt_m2.group(3))
+            month = NORWEGIAN_MONTHS.get(month_word)
+            if month and (1990 <= year <= 2030) and (1 <= day <= 31):
+                return f"{year:04d}-{month:02d}-{day:02d}"
+
+        # 4. Numeric Norwegian format: "23.10.2026" or "23/10/2026"
+        num_m = re.search(r"\b(\d{1,2})[./](\d{1,2})[./](\d{4})\b", clean)
+        if num_m:
+            day = int(num_m.group(1))
+            month = int(num_m.group(2))
+            year = int(num_m.group(3))
+            if 1990 <= year <= 2030 and 1 <= month <= 12 and 1 <= day <= 31:
+                return f"{year:04d}-{month:02d}-{day:02d}"
+
+        return None
 
     @staticmethod
     def normalize_title(title: str) -> str:
@@ -149,6 +215,13 @@ class NewsVerifier:
     @staticmethod
     def find_news_section_url(html: str, base_url: str) -> Optional[str]:
         """Find the primary news or press releases section link from homepage HTML."""
+        # 1. Check for official hosted press rooms (e.g. MyNewsdesk for Posten Bring)
+        mnd_match = re.search(r'href=[\'"](https://www\.mynewsdesk\.com/no/[^\'"]+)[\'"]', html, re.IGNORECASE)
+        if mnd_match:
+            candidate = mnd_match.group(1).strip()
+            if not any(tok in candidate.lower() for tok in ["/images", "/contact_people", "/events", "/search"]):
+                return candidate
+
         news_link_pattern = re.compile(
             r'href=[\'"]([^\'"]*(?:/nyheter|/news|/presse|/pressemeldinger|/aktuelt|/press-releases|/news-and-media|/media/news|/media/press-releases|/siste-nytt)[^\'"]*)[\'"]',
             re.IGNORECASE,
@@ -157,6 +230,14 @@ class NewsVerifier:
         base_domain = urlparse(base_url).netloc.lower()
         if base_domain.startswith("www."):
             base_domain = base_domain[4:]
+
+        rejected_tokens = [
+            "login", "search", "#", "subscription", "subscribe", "abonner",
+            "finn-butikk", "butikker", "karriere", "careers", "kontakt",
+            "contact", "media-contacts", "brand-center", "media-gallery",
+        ]
+
+        valid_urls: list[str] = []
         for m in matches:
             full_url = urljoin(base_url, m.strip())
             parsed = urlparse(full_url)
@@ -164,26 +245,43 @@ class NewsVerifier:
             if host.startswith("www."):
                 host = host[4:]
             if host == base_domain:
-                if not any(token in full_url.lower() for token in ["login", "search", "#"]):
-                    if not any(token in full_url.lower() for token in ["finn-butikk", "butikker", "karriere", "careers"]):
-                        return full_url
-        return None
+                if not any(token in full_url.lower() for token in rejected_tokens):
+                    valid_urls.append(full_url)
+
+        # Prioritize dedicated archive sections over nested articles or forms
+        priority_patterns = [
+            r"/(?:media/news|media/press-releases|nyheter|pressemeldinger|press-releases|presse|aktuelt)/?$",
+            r"/(?:en|no(?:-no)?)/global/media/news/?$",
+            r"/(?:no-no|en)/media/news/?$",
+        ]
+        for pat in priority_patterns:
+            for u in valid_urls:
+                if re.search(pat, urlparse(u).path.lower()):
+                    return u
+
+        return valid_urls[0] if valid_urls else None
 
     @staticmethod
     def parse_iso_date(date_str: str) -> Optional[str]:
         """Validate and format date string as YYYY-MM-DD or ISO-8601 UTC."""
         clean = date_str.strip()
-        # Match YYYY-MM-DD
+        # Match YYYY-MM-DD or ISO with trailing time
         m = re.match(r"^(\d{4}-\d{2}-\d{2})", clean)
         if m:
-            return m.group(1)
+            year, month, day = int(m.group(1)[:4]), int(m.group(1)[5:7]), int(m.group(1)[8:10])
+            if 1990 <= year <= 2030 and 1 <= month <= 12 and 1 <= day <= 31:
+                return f"{year:04d}-{month:02d}-{day:02d}"
+
         # Parse common RFC 2822 or ISO dates
         try:
             from email.utils import parsedate_to_datetime
             dt = parsedate_to_datetime(clean)
             return dt.strftime("%Y-%m-%d")
         except Exception:
-            return None
+            pass
+
+        # Fallback to Norwegian and textual date parsing
+        return NewsVerifier.parse_norwegian_text_date(clean)
 
     def extract_from_rss(self, rss_xml: str, source_domain: str) -> list[NewsArticle]:
         """
@@ -351,5 +449,174 @@ class NewsVerifier:
                                     is_duplicate=False,
                                 )
                             )
+
+        # 4. Search teaser/news-card components (for sites like Hydro, Orkla, Posten Bring)
+        if len(articles) < 5:
+            # 4A. Anchor-wrapped cards (e.g. <a href="..."><article><h2>...</h2><p class="date">...</p></article></a>)
+            a_cards = re.findall(
+                r'(<a[^>]+href=[\'"]([^\'"]+)[\'"][^>]*>(.*?)</a>)',
+                html,
+                re.DOTALL | re.IGNORECASE,
+            )
+            for full_a, href, inner in a_cards:
+                clean_href = href.strip()
+                if not clean_href or clean_href.startswith("#") or clean_href.startswith("javascript:"):
+                    continue
+                if any(tok in clean_href.lower() for tok in ["subscription", "subscribe", "login", "contact", "butikk"]):
+                    continue
+
+                full_url = urljoin(base_url, clean_href)
+                if self.is_homepage_url(full_url, base_url) or self.is_category_url(full_url):
+                    continue
+
+                # Parse publication date from card attributes or inner tags
+                date_cand = None
+                data_date_m = re.search(r'data-(?:date|published|time)=[\'"]([^\'"]+)[\'"]', full_a, re.IGNORECASE)
+                if data_date_m:
+                    date_cand = self.parse_norwegian_text_date(data_date_m.group(1))
+
+                if not date_cand:
+                    time_m = re.search(r'<time[^>]*datetime=[\'"]([^\'"]+)[\'"][^>]*>', full_a, re.IGNORECASE)
+                    if time_m:
+                        date_cand = self.parse_norwegian_text_date(time_m.group(1))
+
+                if not date_cand:
+                    date_span_m = re.search(
+                        r'<(?:p|span|div|time)[^>]*class=[\'"][^\'"]*(?:date|time|published|created)[^\'"]*[\'"][^>]*>(.*?)</(?:p|span|div|time)>',
+                        inner,
+                        re.DOTALL | re.IGNORECASE,
+                    )
+                    if date_span_m:
+                        span_text = re.sub(r'<[^>]+>', ' ', date_span_m.group(1))
+                        date_cand = self.parse_norwegian_text_date(span_text)
+
+                if not date_cand:
+                    inner_text = re.sub(r'<[^>]+>', ' ', inner)
+                    date_cand = self.parse_norwegian_text_date(inner_text)
+
+                if not date_cand:
+                    continue
+
+                # Extract title from inner heading, attribute, or text
+                title_cand = None
+                h_m = re.search(r'<h[1-6][^>]*>(.*?)</h[1-6]>', inner, re.DOTALL | re.IGNORECASE)
+                if h_m:
+                    title_cand = re.sub(r'<[^>]+>', ' ', h_m.group(1)).strip()
+
+                if not title_cand:
+                    aria_m = re.search(r'(?:aria-label|title)=[\'"]([^\'"]+)[\'"]', full_a, re.IGNORECASE)
+                    if aria_m:
+                        title_cand = aria_m.group(1).strip()
+
+                if not title_cand:
+                    raw_text = re.sub(r'<[^>]+>', ' ', inner).strip()
+                    if len(raw_text) >= 15:
+                        title_cand = raw_text
+
+                if not title_cand:
+                    continue
+
+                title_cand = html_lib.unescape(re.sub(r'\s+', ' ', title_cand)).strip()
+                if self.is_navigation_label(title_cand):
+                    continue
+
+                t_hash = self.compute_title_hash(title_cand)
+                if t_hash not in seen_titles:
+                    seen_titles.add(t_hash)
+                    articles.append(
+                        NewsArticle(
+                            title=title_cand,
+                            article_url=full_url,
+                            source=effective_source,
+                            publication_date=date_cand,
+                            retrieval_date=utc_now(),
+                            evidence_span=f"Verified news card date '{date_cand}' for '{title_cand}'.",
+                            is_duplicate=False,
+                        )
+                    )
+
+            # 4B. Container-wrapped cards (e.g. MyNewsdesk / panel stories)
+            div_cards = re.findall(
+                r'(<(?:div|article|li)[^>]*class=[\'"][^\'"]*(?:panel__content|cmp-teaser|teaser|card|story|news-item|article-card)[^\'"]*[\'"][^>]*>.*?</(?:div|article|li)>)',
+                html,
+                re.DOTALL | re.IGNORECASE,
+            )
+            for card in div_cards:
+                a_m = re.search(r'<a[^>]+href=[\'"]([^\'"]+)[\'"][^>]*>(.*?)</a>', card, re.DOTALL | re.IGNORECASE)
+                if not a_m:
+                    continue
+                href = a_m.group(1).strip()
+                if not href or href.startswith("#") or href.startswith("javascript:"):
+                    continue
+                if any(tok in href.lower() for tok in ["subscription", "subscribe", "login", "contact"]):
+                    continue
+
+                full_url = urljoin(base_url, href)
+                if self.is_homepage_url(full_url, base_url) or self.is_category_url(full_url):
+                    continue
+
+                # Parse date from container
+                date_cand = None
+                time_m = re.search(r'<time[^>]*datetime=[\'"]([^\'"]+)[\'"][^>]*>', card, re.IGNORECASE)
+                if time_m:
+                    date_cand = self.parse_norwegian_text_date(time_m.group(1))
+
+                if not date_cand:
+                    time_tag_m = re.search(r'<time[^>]*>(.*?)</time>', card, re.DOTALL | re.IGNORECASE)
+                    if time_tag_m:
+                        date_cand = self.parse_norwegian_text_date(re.sub(r'<[^>]+>', ' ', time_tag_m.group(1)))
+
+                if not date_cand:
+                    data_m = re.search(r'data-(?:date|published|time)=[\'"]([^\'"]+)[\'"]', card, re.IGNORECASE)
+                    if data_m:
+                        date_cand = self.parse_norwegian_text_date(data_m.group(1))
+
+                if not date_cand:
+                    date_span_m = re.search(
+                        r'<(?:p|span|div)[^>]*class=[\'"][^\'"]*(?:date|time|published|created)[^\'"]*[\'"][^>]*>(.*?)</(?:p|span|div)>',
+                        card,
+                        re.DOTALL | re.IGNORECASE,
+                    )
+                    if date_span_m:
+                        date_cand = self.parse_norwegian_text_date(re.sub(r'<[^>]+>', ' ', date_span_m.group(1)))
+
+                if not date_cand:
+                    continue
+
+                # Title
+                title_cand = None
+                h_m = re.search(r'<h[1-6][^>]*>(.*?)</h[1-6]>', card, re.DOTALL | re.IGNORECASE)
+                if h_m:
+                    title_cand = re.sub(r'<[^>]+>', ' ', h_m.group(1)).strip()
+
+                if not title_cand:
+                    aria_m = re.search(r'(?:aria-label|title)=[\'"]([^\'"]+)[\'"]', a_m.group(0), re.IGNORECASE)
+                    if aria_m:
+                        title_cand = aria_m.group(1).strip()
+
+                if not title_cand:
+                    title_cand = re.sub(r'<[^>]+>', ' ', a_m.group(2)).strip()
+
+                if not title_cand:
+                    continue
+
+                title_cand = html_lib.unescape(re.sub(r'\s+', ' ', title_cand)).strip()
+                if self.is_navigation_label(title_cand):
+                    continue
+
+                t_hash = self.compute_title_hash(title_cand)
+                if t_hash not in seen_titles:
+                    seen_titles.add(t_hash)
+                    articles.append(
+                        NewsArticle(
+                            title=title_cand,
+                            article_url=full_url,
+                            source=effective_source,
+                            publication_date=date_cand,
+                            retrieval_date=utc_now(),
+                            evidence_span=f"Verified news card date '{date_cand}' for '{title_cand}'.",
+                            is_duplicate=False,
+                        )
+                    )
 
         return articles
