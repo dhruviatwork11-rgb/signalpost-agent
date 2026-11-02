@@ -45,9 +45,23 @@ class JobPostingList(list):
 class JobVerifier:
     """Discovers, validates, and verifies individual job advertisements."""
 
-    _lock = threading.Lock()
+    _circuit_lock = threading.Lock()
+    _request_lock = threading.Lock()
     _last_request_ts = 0.0
     _min_request_interval = 1.2  # Seconds after completion before next request starts
+
+    # Process-wide NAV circuit breaker state across all instances
+    _circuit_open: bool = False
+    _consecutive_429: int = 0
+    _consecutive_429_threshold: int = 2
+    _circuit_cooldown_seconds: float = 120.0
+    _circuit_blocked_until: float = 0.0
+    _probe_in_flight: bool = False
+
+    # Observability metrics
+    _nav_requests_sent: int = 0
+    _nav_429_received: int = 0
+    _nav_circuit_skips: int = 0
 
     def __init__(
         self,
@@ -57,6 +71,8 @@ class JobVerifier:
         http_client: Optional[httpx.Client] = None,
         db: Optional[Any] = None,
         cache_ttl_seconds: int = 86400,
+        circuit_cooldown_seconds: Optional[float] = None,
+        circuit_failure_threshold: Optional[int] = None,
     ):
         self.base_api_url = base_api_url
         self.timeout = timeout
@@ -64,28 +80,157 @@ class JobVerifier:
         self._http_client = http_client
         self.db = db
         self.cache_ttl_seconds = cache_ttl_seconds
+        if circuit_cooldown_seconds is not None:
+            JobVerifier._circuit_cooldown_seconds = float(circuit_cooldown_seconds)
+        if circuit_failure_threshold is not None:
+            JobVerifier._consecutive_429_threshold = int(circuit_failure_threshold)
+
+    @classmethod
+    def configure_circuit_breaker(
+        cls,
+        cooldown_seconds: float = 120.0,
+        failure_threshold: int = 2,
+    ) -> None:
+        """Configure circuit breaker parameters."""
+        with cls._circuit_lock:
+            cls._circuit_cooldown_seconds = float(cooldown_seconds)
+            cls._consecutive_429_threshold = int(failure_threshold)
+
+    @classmethod
+    def reset_circuit_breaker(cls) -> None:
+        """Reset circuit breaker state to closed with zero counters."""
+        with cls._circuit_lock:
+            cls._circuit_open = False
+            cls._consecutive_429 = 0
+            cls._circuit_blocked_until = 0.0
+            cls._probe_in_flight = False
+            cls._nav_requests_sent = 0
+            cls._nav_429_received = 0
+            cls._nav_circuit_skips = 0
+
+    @classmethod
+    def get_circuit_status(cls) -> dict[str, Any]:
+        """Return diagnostic metrics and state of circuit breaker."""
+        with cls._circuit_lock:
+            now = time.monotonic()
+            is_open = cls._circuit_open
+            remaining = max(0.0, cls._circuit_blocked_until - now) if is_open else 0.0
+            return {
+                "is_open": is_open,
+                "consecutive_429": cls._consecutive_429,
+                "cooldown_remaining_seconds": round(remaining, 2),
+                "probe_in_flight": cls._probe_in_flight,
+                "requests_sent": cls._nav_requests_sent,
+                "429_received": cls._nav_429_received,
+                "circuit_skips": cls._nav_circuit_skips,
+            }
+
+    @classmethod
+    def _acquire_nav_permission(cls) -> tuple[bool, bool, str]:
+        """
+        Check circuit breaker before initiating NAV requests.
+        Returns:
+            (allowed: bool, is_probe: bool, reason: str)
+        """
+        with cls._circuit_lock:
+            now = time.monotonic()
+            if not cls._circuit_open:
+                return True, False, ""
+
+            # Circuit is open. Check if cooldown has expired
+            if now >= cls._circuit_blocked_until:
+                if not cls._probe_in_flight:
+                    # Sole probe permission granted to this worker
+                    cls._probe_in_flight = True
+                    return True, True, "Circuit half-open: probe request in flight."
+                else:
+                    cls._nav_circuit_skips += 1
+                    return False, False, "NAV Arbeidsplassen circuit breaker recovery probe in flight; request skipped."
+
+            # Circuit remains strictly open
+            cls._nav_circuit_skips += 1
+            remaining = int(cls._circuit_blocked_until - now)
+            return (
+                False,
+                False,
+                f"NAV Arbeidsplassen circuit breaker open due to consecutive 429 rate limit responses ({remaining}s cooldown remaining).",
+            )
+
+    @classmethod
+    def _record_nav_outcome(cls, status_code: Optional[int], was_probe: bool) -> None:
+        """
+        Update circuit breaker state based on NAV response status.
+        Thread-safe under cls._circuit_lock.
+        """
+        with cls._circuit_lock:
+            cls._nav_requests_sent += 1
+            now = time.monotonic()
+
+            if status_code == 429:
+                cls._nav_429_received += 1
+                cls._consecutive_429 += 1
+                if was_probe or cls._consecutive_429 >= cls._consecutive_429_threshold:
+                    cls._circuit_open = True
+                    cls._circuit_blocked_until = now + cls._circuit_cooldown_seconds
+                    cls._probe_in_flight = False
+            elif status_code == 200:
+                cls._consecutive_429 = 0
+                cls._circuit_open = False
+                cls._circuit_blocked_until = 0.0
+                cls._probe_in_flight = False
+            else:
+                if was_probe:
+                    # Probe failed to obtain 200 OK -> reopen circuit with new cooldown
+                    cls._circuit_open = True
+                    cls._circuit_blocked_until = now + cls._circuit_cooldown_seconds
+                    cls._probe_in_flight = False
+
+    @classmethod
+    def _release_probe_if_abandoned(cls) -> None:
+        """Ensure probe flag is cleaned up if a probe request failed before outcome recording."""
+        with cls._circuit_lock:
+            if cls._probe_in_flight:
+                cls._circuit_open = True
+                cls._circuit_blocked_until = time.monotonic() + cls._circuit_cooldown_seconds
+                cls._probe_in_flight = False
 
     def _execute_request(self, url: str, headers: dict[str, str]) -> tuple[Optional[httpx.Response], Optional[str]]:
         """Pace requests to NAV Arbeidsplassen public API with dedicated inter-thread serialized rate limiting."""
         is_nav = "arbeidsplassen.nav.no" in url
 
         if is_nav:
-            with JobVerifier._lock:
+            # Check circuit breaker before waiting on request lock
+            with JobVerifier._circuit_lock:
+                now = time.monotonic()
+                if JobVerifier._circuit_open and now < JobVerifier._circuit_blocked_until and not JobVerifier._probe_in_flight:
+                    JobVerifier._nav_circuit_skips += 1
+                    return None, "NAV Arbeidsplassen circuit breaker open due to rate limiting."
+
+            with JobVerifier._request_lock:
                 now = time.monotonic()
                 elapsed = now - JobVerifier._last_request_ts
                 if elapsed < JobVerifier._min_request_interval:
                     time.sleep(JobVerifier._min_request_interval - elapsed)
+
+                with JobVerifier._circuit_lock:
+                    was_probe = JobVerifier._probe_in_flight
+
+                response = None
+                err = None
                 try:
                     if self._http_client is not None:
                         response = self._http_client.get(url, headers=headers)
                     else:
                         with httpx.Client(timeout=self.timeout) as client:
                             response = client.get(url, headers=headers)
-                    return response, None
                 except Exception as exc:
-                    return None, str(exc)
+                    err = str(exc)
                 finally:
                     JobVerifier._last_request_ts = time.monotonic()
+                    status_code = response.status_code if response is not None else None
+                    JobVerifier._record_nav_outcome(status_code, was_probe)
+
+                return response, err
 
         try:
             if self._http_client is not None:
@@ -236,91 +381,115 @@ class JobVerifier:
             except Exception:
                 pass
 
-        # Extract normalized company name without corporate form suffix
-        base_name = re.sub(
-            r"\b(?:ASA|AS|SF|ENK|DA|ANS|BA|FLI|NUF|IKS|KF)\b",
-            "",
-            clean_legal,
-            flags=re.IGNORECASE,
-        ).strip()
-        clean_base = re.sub(r"\s+", " ", base_name).strip()
+        # 2. Check Circuit Breaker before making any external NAV HTTP calls
+        allowed, is_probe, reason = self._acquire_nav_permission()
+        if not allowed:
+            return JobPostingList(
+                [],
+                status="blocked",
+                search_url=self.base_api_url,
+                query_term=clean_legal,
+                error_message=reason,
+            )
 
-        # Prioritize search by clean base name (e.g. "Telenor", "Veidekke"), then legal name fallback
-        search_terms = []
-        if clean_base and len(clean_base) >= 2:
-            search_terms.append(clean_base)
-        if clean_legal not in search_terms:
-            search_terms.append(clean_legal)
+        acquired_probe = is_probe
+        try:
+            # Extract normalized company name without corporate form suffix
+            base_name = re.sub(
+                r"\b(?:ASA|AS|SF|ENK|DA|ANS|BA|FLI|NUF|IKS|KF)\b",
+                "",
+                clean_legal,
+                flags=re.IGNORECASE,
+            ).strip()
+            clean_base = re.sub(r"\s+", " ", base_name).strip()
 
-        headers = {
-            "Accept": "application/json",
-            "User-Agent": self.user_agent,
-        }
+            # Prioritize search by clean base name (e.g. "Telenor", "Veidekke"), then legal name fallback
+            search_terms = []
+            if clean_base and len(clean_base) >= 2:
+                search_terms.append(clean_base)
+            if clean_legal not in search_terms:
+                search_terms.append(clean_legal)
 
-        all_hits = []
-        seen_uuids = set()
-        search_status = "completed"
-        last_search_url = ""
-        effective_term = search_terms[0] if search_terms else clean_legal
-        last_error = None
+            headers = {
+                "Accept": "application/json",
+                "User-Agent": self.user_agent,
+            }
 
-        for term in search_terms:
-            effective_term = term
-            url = f"{self.base_api_url}?q={quote(term)}&size={max_results * 2}"
-            last_search_url = url
-
-            response, err = self._execute_request(url, headers)
-            if err:
-                search_status = "failed"
-                last_error = err
-                continue
-
-            if response is None:
-                search_status = "failed"
-                continue
-
-            if response.status_code == 429:
-                search_status = "blocked"
-                # Conservative retry with backoff honoring Retry-After if provided
-                backoff = 2.0
-                retry_header = response.headers.get("Retry-After")
-                if retry_header:
-                    try:
-                        parsed_wait = float(retry_header.strip())
-                        backoff = min(max(parsed_wait, 1.0), 5.0)
-                    except Exception:
-                        backoff = 2.0
-                time.sleep(backoff)
-                response, err = self._execute_request(url, headers)
-                if response and response.status_code == 200:
-                    search_status = "completed"
-                else:
-                    search_status = "blocked"
-                    break
-
-            if response.status_code != 200:
-                search_status = "failed" if response.status_code >= 500 else "blocked"
-                continue
-
-            try:
-                payload = response.json()
-            except Exception as e:
-                search_status = "failed"
-                last_error = str(e)
-                continue
-
-            raw_hits = payload.get("hits", {})
-            hit_list = raw_hits.get("hits", []) if isinstance(raw_hits, dict) else []
-            for h in hit_list:
-                uuid = h.get("_source", {}).get("uuid")
-                if uuid and uuid not in seen_uuids:
-                    seen_uuids.add(uuid)
-                    all_hits.append(h)
-
+            all_hits = []
+            seen_uuids = set()
             search_status = "completed"
-            # Single-query optimization: if first term yielded hits, do not query the second term
-            if all_hits:
-                break
+            last_search_url = ""
+            effective_term = search_terms[0] if search_terms else clean_legal
+            last_error = None
+
+            for term in search_terms:
+                effective_term = term
+                url = f"{self.base_api_url}?q={quote(term)}&size={max_results * 2}"
+                last_search_url = url
+
+                response, err = self._execute_request(url, headers)
+                if err:
+                    search_status = "failed"
+                    last_error = err
+                    continue
+
+                if response is None:
+                    search_status = "failed"
+                    continue
+
+                if response.status_code == 429:
+                    search_status = "blocked"
+                    last_error = "NAV Arbeidsplassen rate-limited (HTTP 429)"
+                    # Check if circuit breaker opened on this 429
+                    with JobVerifier._circuit_lock:
+                        circuit_is_open = JobVerifier._circuit_open
+                    if circuit_is_open:
+                        break
+
+                    # Conservative retry with backoff honoring Retry-After if provided
+                    backoff = 2.0
+                    retry_header = response.headers.get("Retry-After")
+                    if retry_header:
+                        try:
+                            parsed_wait = float(retry_header.strip())
+                            backoff = min(max(parsed_wait, 1.0), 5.0)
+                        except Exception:
+                            backoff = 2.0
+                    time.sleep(backoff)
+                    response, err = self._execute_request(url, headers)
+                    if response and response.status_code == 200:
+                        search_status = "completed"
+                    else:
+                        search_status = "blocked"
+                        last_error = err or "NAV Arbeidsplassen rate-limited on retry (HTTP 429)"
+                        break
+
+                if response.status_code != 200:
+                    search_status = "failed" if response.status_code >= 500 else "blocked"
+                    continue
+
+                try:
+                    payload = response.json()
+                except Exception as e:
+                    search_status = "failed"
+                    last_error = str(e)
+                    continue
+
+                raw_hits = payload.get("hits", {})
+                hit_list = raw_hits.get("hits", []) if isinstance(raw_hits, dict) else []
+                for h in hit_list:
+                    uuid = h.get("_source", {}).get("uuid")
+                    if uuid and uuid not in seen_uuids:
+                        seen_uuids.add(uuid)
+                        all_hits.append(h)
+
+                search_status = "completed"
+                # Single-query optimization: if first term yielded hits, do not query the second term
+                if all_hits:
+                    break
+        finally:
+            if acquired_probe:
+                JobVerifier._release_probe_if_abandoned()
 
         postings: list[JobPosting] = []
         now_utc = utc_now()

@@ -1368,6 +1368,254 @@ def test_v2_4_news_section_discovery_orkla_hydro_posten():
     assert verifier.find_news_section_url(orkla_html, "https://www.orkla.com") == "https://www.orkla.com/media/press-releases/"
 
 
+def test_v2_4_1_circuit_breaker_opens_after_two_429s():
+    """Verify that circuit breaker opens globally after two consecutive HTTP 429 responses."""
+    JobVerifier.reset_circuit_breaker()
+    JobVerifier.configure_circuit_breaker(cooldown_seconds=60.0, failure_threshold=2)
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429)
+
+    client = httpx.Client(transport=httpx.MockTransport(mock_handler))
+    verifier = JobVerifier(http_client=client)
+
+    # First company search: makes request (429) + retry (429) -> 2 consecutive 429s
+    res = verifier.fetch_nav_vacancies("Telenor ASA", "982463718")
+    assert res.status == "blocked"
+
+    # Circuit should now be open
+    status = JobVerifier.get_circuit_status()
+    assert status["is_open"] is True
+    assert status["consecutive_429"] >= 2
+    assert status["cooldown_remaining_seconds"] > 0
+    JobVerifier.reset_circuit_breaker()
+
+
+def test_v2_4_1_no_http_requests_while_circuit_open():
+    """Verify that when circuit is open, subsequent calls skip network requests entirely."""
+    JobVerifier.reset_circuit_breaker()
+    JobVerifier.configure_circuit_breaker(cooldown_seconds=60.0, failure_threshold=2)
+
+    call_count = 0
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(429)
+
+    client = httpx.Client(transport=httpx.MockTransport(mock_handler))
+    verifier = JobVerifier(http_client=client)
+
+    # Trip the circuit
+    verifier.fetch_nav_vacancies("Company 1 AS", "911111111")
+    assert JobVerifier.get_circuit_status()["is_open"] is True
+    initial_calls = call_count
+    assert initial_calls >= 2
+
+    # Query 5 more companies while circuit is open
+    for i in range(2, 7):
+        res = verifier.fetch_nav_vacancies(f"Company {i} AS", f"92222222{i}")
+        assert res.status == "blocked"
+        assert len(res) == 0
+        assert "circuit breaker open" in (res.error_message or "").lower()
+
+    # Zero additional network requests made!
+    assert call_count == initial_calls
+    status = JobVerifier.get_circuit_status()
+    assert status["circuit_skips"] >= 5
+    JobVerifier.reset_circuit_breaker()
+
+
+def test_v2_4_1_correct_blocked_status_for_skipped_companies():
+    """Verify that skipped companies emit contract-compliant availability='blocked' without zero-vacancy claims."""
+    JobVerifier.reset_circuit_breaker()
+    JobVerifier.configure_circuit_breaker(cooldown_seconds=60.0, failure_threshold=1)
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429)
+
+    client = httpx.Client(transport=httpx.MockTransport(mock_handler))
+    verifier = JobVerifier(http_client=client)
+
+    # Trip breaker
+    verifier.fetch_nav_vacancies("Target 1 AS", "911111111")
+
+    # Target 2 is skipped by open breaker
+    res2 = verifier.fetch_nav_vacancies("Target 2 AS", "922222222")
+    assert res2.status == "blocked"
+    assert len(res2) == 0
+
+    # Build envelope for Target 2
+    from app.models import CompanyProfile, SourceEvidence
+    prof = CompanyProfile(
+        org_nr="922222222",
+        name="Target 2 AS",
+        job_postings=res2,
+        job_search_status=res2.status,
+    )
+    ev = SourceEvidence(
+        source_name="Enhetsregisteret",
+        source_url="https://api.brreg.no",
+        response_hash="test",
+        retrieved_at=utc_now(),
+    )
+    now = utc_now()
+    env = build_terminal_envelope(
+        org_nr="922222222",
+        run_id="test-run",
+        started_at=now,
+        completed_at=now,
+        profile=prof,
+        evidence=ev,
+    )
+
+    # Find job_postings claim
+    job_claim = next((c for c in env["claims"] if c["field"] == "job_postings"), None)
+    assert job_claim is not None
+    assert job_claim["availability"] == "blocked"
+    assert job_claim["value"] is None
+    assert len(job_claim["evidence_ids"]) == 1
+
+    JobVerifier.reset_circuit_breaker()
+
+
+def test_v2_4_1_circuit_recovery_after_cooldown():
+    """Verify that after cooldown expires, a probe request is allowed and success closes circuit."""
+    import time
+    JobVerifier.reset_circuit_breaker()
+    # Configure tiny 0.05s cooldown for fast testing
+    JobVerifier.configure_circuit_breaker(cooldown_seconds=0.05, failure_threshold=1)
+
+    responses = [httpx.Response(429), httpx.Response(200, json={"hits": {"hits": []}})]
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        if responses:
+            return responses.pop(0)
+        return httpx.Response(200, json={"hits": {"hits": []}})
+
+    client = httpx.Client(transport=httpx.MockTransport(mock_handler))
+    verifier = JobVerifier(http_client=client)
+
+    # 1. Trip breaker with 429
+    res1 = verifier.fetch_nav_vacancies("Company 1 AS", "911111111")
+    assert res1.status == "blocked"
+    assert JobVerifier.get_circuit_status()["is_open"] is True
+
+    # 2. Wait for cooldown to expire
+    time.sleep(0.07)
+
+    # 3. Next request probes and receives 200 OK
+    res2 = verifier.fetch_nav_vacancies("Company 2 AS", "922222222")
+    assert res2.status == "completed"
+
+    # Circuit should now be closed!
+    status = JobVerifier.get_circuit_status()
+    assert status["is_open"] is False
+    assert status["consecutive_429"] == 0
+    JobVerifier.reset_circuit_breaker()
+
+
+def test_v2_4_1_failed_recovery_probe_reopens_circuit():
+    """Verify that a probe returning 429 immediately reopens the circuit and resets cooldown."""
+    import time
+    JobVerifier.reset_circuit_breaker()
+    JobVerifier.configure_circuit_breaker(cooldown_seconds=0.05, failure_threshold=1)
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429)
+
+    client = httpx.Client(transport=httpx.MockTransport(mock_handler))
+    verifier = JobVerifier(http_client=client)
+
+    # Trip breaker
+    verifier.fetch_nav_vacancies("Company 1 AS", "911111111")
+    assert JobVerifier.get_circuit_status()["is_open"] is True
+
+    # Wait for cooldown
+    time.sleep(0.07)
+
+    # Probe request also returns 429 -> circuit must reopen immediately
+    res_probe = verifier.fetch_nav_vacancies("Company 2 AS", "922222222")
+    assert res_probe.status == "blocked"
+
+    status = JobVerifier.get_circuit_status()
+    assert status["is_open"] is True
+    assert status["cooldown_remaining_seconds"] > 0
+    JobVerifier.reset_circuit_breaker()
+
+
+def test_v2_4_1_concurrent_workers_not_issuing_multiple_probes():
+    """Verify thread-safety: only one worker issues a probe request while others are safely skipped."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    JobVerifier.reset_circuit_breaker()
+    JobVerifier.configure_circuit_breaker(cooldown_seconds=0.05, failure_threshold=1)
+
+    probe_http_count = 0
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal probe_http_count
+        probe_http_count += 1
+        time.sleep(0.08)  # simulate network delay during probe
+        # Return 429 so probe reopens the circuit
+        return httpx.Response(429)
+
+    # Trip breaker first
+    with httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(429))) as trip_client:
+        JobVerifier(http_client=trip_client).fetch_nav_vacancies("Trip AS", "900000001")
+
+    assert JobVerifier.get_circuit_status()["is_open"] is True
+
+    # Cooldown expires
+    time.sleep(0.06)
+
+    # 4 concurrent threads race to query NAV
+    client = httpx.Client(transport=httpx.MockTransport(mock_handler))
+    verifier = JobVerifier(http_client=client)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [
+            executor.submit(verifier.fetch_nav_vacancies, f"Concurrent {i} AS", f"93333333{i}")
+            for i in range(4)
+        ]
+        results = [f.result() for f in futures]
+
+    # Exactly ONE thread dispatched an HTTP probe; the other 3 were safely skipped!
+    assert probe_http_count == 1
+    # All 4 returned valid JobPostingList results with blocked status
+    assert len(results) == 4
+    for r in results:
+        assert r.status == "blocked"
+    JobVerifier.reset_circuit_breaker()
+
+
+def test_v2_4_1_blocked_responses_never_cached(tmp_path):
+    """Verify that circuit-breaker blocked responses never enter the completed-search cache."""
+    db_file = tmp_path / "test_cb_cache.db"
+    db = DatabaseService(db_file)
+
+    JobVerifier.reset_circuit_breaker()
+    JobVerifier.configure_circuit_breaker(cooldown_seconds=60.0, failure_threshold=1)
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429)
+
+    client = httpx.Client(transport=httpx.MockTransport(mock_handler))
+    verifier = JobVerifier(http_client=client, db=db)
+
+    # Query trips circuit and returns blocked
+    res = verifier.fetch_nav_vacancies("Blocked AS", "944444444")
+    assert res.status == "blocked"
+
+    # Verify cache has NO record for this org
+    cache_key = JobVerifier.build_cache_key("944444444", "Blocked AS", 5)
+    cached = db.get_job_search_cache(cache_key)
+    assert cached is None
+    JobVerifier.reset_circuit_breaker()
+
+
+
 
 
 
