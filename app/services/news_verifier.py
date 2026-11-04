@@ -78,6 +78,51 @@ class NewsVerifier:
     """Extracts and verifies genuine company news articles with strict publication date enforcement."""
 
     @staticmethod
+    def extract_meta_tag(html: str, property_or_name: str) -> Optional[str]:
+        """
+        Extract content from <meta> tag matching property, name, or itemprop attribute.
+        Handles both attribute orders (content before name, or name before content).
+        """
+        p_esc = re.escape(property_or_name)
+        # Order 1: name/property before content
+        m1 = re.search(
+            rf'<meta\b[^>]*?\b(?:property|name|itemprop)\s*=\s*[\'"]{p_esc}[\'"][^>]*?\bcontent\s*=\s*[\'"]([^\'"]*?)[\'"]',
+            html,
+            re.IGNORECASE,
+        )
+        if m1:
+            return m1.group(1).strip()
+
+        # Order 2: content before name/property
+        m2 = re.search(
+            rf'<meta\b[^>]*?\bcontent\s*=\s*[\'"]([^\'"]*?)[\'"][^>]*?\b(?:property|name|itemprop)\s*=\s*[\'"]{p_esc}[\'"]',
+            html,
+            re.IGNORECASE,
+        )
+        if m2:
+            return m2.group(1).strip()
+
+        return None
+
+    @staticmethod
+    def extract_canonical_url(html: str, base_url: str) -> Optional[str]:
+        """Extract canonical URL from <link rel="canonical" href="...">."""
+        m = re.search(
+            r'<link\b[^>]*?\brel\s*=\s*[\'"]canonical[\'"][^>]*?\bhref\s*=\s*[\'"]([^\'"]+?)[\'"]',
+            html,
+            re.IGNORECASE,
+        )
+        if not m:
+            m = re.search(
+                r'<link\b[^>]*?\bhref\s*=\s*[\'"]([^\'"]+?)[\'"][^>]*?\brel\s*=\s*[\'"]canonical[\'"]',
+                html,
+                re.IGNORECASE,
+            )
+        if m:
+            return urljoin(base_url, m.group(1).strip())
+        return None
+
+    @staticmethod
     def parse_norwegian_text_date(text: str) -> Optional[str]:
         """
         Parse textual, numeric Norwegian, or ISO dates into verified YYYY-MM-DD.
@@ -385,16 +430,29 @@ class NewsVerifier:
 
         # 2. Search OpenGraph article metadata if no JSON-LD found
         if not articles:
-            og_title_m = re.search(r'<meta[^>]+property=[\'"]og:title[\'"][^>]+content=[\'"]([^\'"]+)[\'"]', html, re.IGNORECASE)
-            og_date_m = re.search(r'<meta[^>]+property=[\'"]article:published_time[\'"][^>]+content=[\'"]([^\'"]+)[\'"]', html, re.IGNORECASE)
-            og_url_m = re.search(r'<meta[^>]+property=[\'"]og:url[\'"][^>]+content=[\'"]([^\'"]+)[\'"]', html, re.IGNORECASE)
+            og_title = self.extract_meta_tag(html, "og:title") or self.extract_meta_tag(html, "twitter:title")
+            raw_date = None
+            date_meta_names = [
+                "article:published_time",
+                "og:published_time",
+                "publication_date",
+                "publish_date",
+                "date",
+                "datePublished",
+                "sailthru.date",
+            ]
+            for d_name in date_meta_names:
+                d_val = self.extract_meta_tag(html, d_name)
+                if d_val:
+                    raw_date = d_val
+                    break
 
-            if og_title_m and og_date_m:
-                title = html_lib.unescape(og_title_m.group(1).strip())
-                raw_date = og_date_m.group(1).strip()
-                raw_url = og_url_m.group(1).strip() if og_url_m else base_url
+            raw_url = self.extract_canonical_url(html, base_url) or self.extract_meta_tag(html, "og:url") or base_url
+
+            if og_title and raw_date:
+                title = html_lib.unescape(og_title.strip())
                 full_url = urljoin(base_url, raw_url)
-                pub_date = self.parse_iso_date(raw_date)
+                pub_date = self.parse_norwegian_text_date(raw_date)
 
                 if (
                     pub_date
@@ -402,17 +460,20 @@ class NewsVerifier:
                     and not self.is_homepage_url(full_url, base_url)
                     and not self.is_category_url(full_url)
                 ):
-                    articles.append(
-                        NewsArticle(
-                            title=title,
-                            article_url=full_url,
-                            source=effective_source,
-                            publication_date=pub_date,
-                            retrieval_date=utc_now(),
-                            evidence_span=f"Verified OpenGraph article:published_time '{pub_date}'.",
-                            is_duplicate=False,
+                    t_hash = self.compute_title_hash(title)
+                    if t_hash not in seen_titles:
+                        seen_titles.add(t_hash)
+                        articles.append(
+                            NewsArticle(
+                                title=title,
+                                article_url=full_url,
+                                source=effective_source,
+                                publication_date=pub_date,
+                                retrieval_date=utc_now(),
+                                evidence_span=f"Verified OpenGraph article metadata '{pub_date}' for '{title}'.",
+                                is_duplicate=False,
+                            )
                         )
-                    )
 
         # 3. Search semantic HTML <article> tags containing title link and <time datetime="...">
         if not articles:

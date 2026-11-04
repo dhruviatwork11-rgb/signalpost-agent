@@ -120,6 +120,33 @@ class JobPosting(BaseModel):
     evidence_span: Optional[str] = None
 
 
+class CompanyRole(BaseModel):
+    """Official corporate management role or board position from Brønnøysund."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    role_code: str = Field(..., description="Role code, e.g. DAGL, LEDE, MEDL")
+    role_title: str = Field(..., description="Role description, e.g. Daglig leder, Styrets leder")
+    name: str = Field(..., description="Full name of person holding role")
+    birth_date: Optional[str] = Field(default=None, description="Birth date (YYYY-MM-DD) if available")
+    is_active: bool = Field(default=True, description="True if role is active")
+
+
+class FinancialAccounts(BaseModel):
+    """Official accounting figures from Regnskapsregisteret."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    financial_year: str = Field(..., description="Fiscal year (YYYY)")
+    period_end: Optional[str] = Field(default=None, description="Period end date (YYYY-MM-DD)")
+    currency: str = Field(default="NOK", description="Reporting currency (e.g. NOK, USD)")
+    revenue: Optional[float] = Field(default=None, description="Total sales/operating revenue (driftsinntekter)")
+    annual_result: Optional[float] = Field(default=None, description="Annual net profit/loss (aarsresultat)")
+    operating_result: Optional[float] = Field(default=None, description="Operating profit/loss (driftsresultat)")
+    total_assets: Optional[float] = Field(default=None, description="Total assets (sumEiendeler)")
+    total_equity: Optional[float] = Field(default=None, description="Total equity (sumEgenkapital)")
+
+
 class CompanyProfile(BaseModel):
     """Structured company profile sourced from official public registries."""
 
@@ -210,6 +237,20 @@ class CompanyProfile(BaseModel):
         default="completed",
         description="News discovery status: completed, not_applicable, or failed",
     )
+    management_roles: list[CompanyRole] = Field(
+        default_factory=list, description="Verified corporate management and board members"
+    )
+    roles_search_status: str = Field(
+        default="completed",
+        description="Status of roles lookup: completed, not_available, blocked, failed",
+    )
+    financial_accounts: Optional[FinancialAccounts] = Field(
+        default=None, description="Verified financial accounts figures from Regnskapsregisteret"
+    )
+    financials_search_status: str = Field(
+        default="completed",
+        description="Status of financials lookup: completed, not_available, blocked, failed",
+    )
 
     raw_data: Optional[dict[str, Any]] = Field(
         default=None, exclude=True, description="Unmodified response dictionary for auditing"
@@ -258,9 +299,31 @@ class CompanyProfile(BaseModel):
         if details:
             parts.append("Key verified details: " + "; ".join(details) + ".")
 
+        # Key personnel / management
+        mgmt_parts = []
+        dagl = next((r for r in self.management_roles if r.role_code == "DAGL" and r.is_active), None)
+        lede = next((r for r in self.management_roles if r.role_code == "LEDE" and r.is_active), None)
+        if dagl:
+            mgmt_parts.append(f"{dagl.name} (Daglig leder/CEO)")
+        if lede:
+            mgmt_parts.append(f"{lede.name} (Styreleder/Board Chair)")
+        if mgmt_parts:
+            parts.append("Key personnel: " + ", ".join(mgmt_parts) + ".")
+
+        # Financial figures
+        if self.financial_accounts:
+            fa = self.financial_accounts
+            fin_items = []
+            if fa.revenue is not None:
+                fin_items.append(f"revenue {fa.revenue:,.0f} {fa.currency}")
+            if fa.annual_result is not None:
+                fin_items.append(f"annual net result {fa.annual_result:,.0f} {fa.currency}")
+            if fin_items:
+                parts.append(f"Financial highlights ({fa.financial_year}): " + "; ".join(fin_items) + ".")
+
         extra = []
         if self.job_postings:
-            extra.append(f"{len(self.job_postings)} active vacancy{'ies' if len(self.job_postings) != 1 else ''}")
+            extra.append(f"{len(self.job_postings)} active vacanc{'y' if len(self.job_postings) == 1 else 'ies'}")
         if self.news_articles:
             extra.append(f"{len(self.news_articles)} verified news article{'s' if len(self.news_articles) != 1 else ''}")
         if self.social_profiles:

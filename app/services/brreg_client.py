@@ -7,8 +7,8 @@ import re
 from typing import Any, Optional
 import httpx
 
-from app.config import BRREG_API_BASE_URL, REQUEST_TIMEOUT_SECONDS, USER_AGENT
-from app.models import Address, CompanyProfile, SourceEvidence, utc_now
+from app.config import BRREG_API_BASE_URL, REGNSKAP_API_BASE_URL, REQUEST_TIMEOUT_SECONDS, USER_AGENT
+from app.models import Address, CompanyProfile, CompanyRole, FinancialAccounts, SourceEvidence, utc_now
 
 
 class BrregError(Exception):
@@ -55,11 +55,13 @@ class BrregClient:
     def __init__(
         self,
         base_url: str = BRREG_API_BASE_URL,
+        regnskap_base_url: str = REGNSKAP_API_BASE_URL,
         timeout: float = REQUEST_TIMEOUT_SECONDS,
         user_agent: str = USER_AGENT,
         http_client: Optional[httpx.Client] = None,
     ):
         self.base_url = base_url.rstrip("/")
+        self.regnskap_base_url = regnskap_base_url.rstrip("/")
         self.timeout = timeout
         self.user_agent = user_agent
         self._http_client = http_client
@@ -67,6 +69,14 @@ class BrregClient:
     def build_unit_url(self, org_nr: str) -> str:
         """Construct the official Enhetsregisteret API endpoint URL for an organization."""
         return f"{self.base_url}/enheter/{org_nr}"
+
+    def build_roles_url(self, org_nr: str) -> str:
+        """Construct the official Enhetsregisteret roller API endpoint URL for an organization."""
+        return f"{self.base_url}/enheter/{org_nr}/roller"
+
+    def build_accounts_url(self, org_nr: str) -> str:
+        """Construct the official Regnskapsregisteret API endpoint URL for an organization."""
+        return f"{self.regnskap_base_url}/{org_nr}"
 
     @staticmethod
     def compute_payload_hash(data: dict[str, Any]) -> str:
@@ -289,3 +299,240 @@ class BrregClient:
             retrieved_at=utc_now(),
             status_code=response.status_code,
         )
+
+    def fetch_roles(self, org_nr: str) -> tuple[list[CompanyRole], Optional[SourceEvidence], str]:
+        """
+        Fetch verified corporate management and board members from official Brønnøysund Roller API.
+        Extracts daglig leder (CEO), styreleder (board chair), and board members.
+        Returns (roles_list, evidence, status) where status is:
+        - 'completed': Roles found and verified.
+        - 'not_available': 404 or company has no registered roles.
+        - 'blocked': Rate limited (HTTP 429) or forbidden.
+        - 'failed': Network error, timeout, or server error.
+        """
+        cleaned_org_nr = re.sub(r"\s+", "", str(org_nr))
+        if not re.fullmatch(r"^\d{9}$", cleaned_org_nr):
+            return [], None, "failed"
+
+        url = self.build_roles_url(cleaned_org_nr)
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": self.user_agent,
+        }
+
+        try:
+            if self._http_client is not None:
+                response = self._http_client.get(url, headers=headers)
+            else:
+                with httpx.Client(timeout=self.timeout) as client:
+                    response = client.get(url, headers=headers)
+        except httpx.TimeoutException:
+            return [], None, "failed"
+        except (httpx.ConnectError, httpx.NetworkError, httpx.RequestError):
+            return [], None, "failed"
+        except Exception:
+            return [], None, "failed"
+
+        if response.status_code == 404:
+            return [], None, "not_available"
+        elif response.status_code == 429:
+            return [], None, "blocked"
+        elif response.status_code in (401, 403):
+            return [], None, "blocked"
+        elif response.is_error:
+            return [], None, "failed"
+
+        try:
+            raw_data = response.json()
+        except Exception:
+            return [], None, "failed"
+
+        if not isinstance(raw_data, dict):
+            return [], None, "failed"
+
+        # Verify entity link matches requested organization number if present
+        enhet_link = raw_data.get("_links", {}).get("enhet", {}).get("href", "")
+        if enhet_link and not enhet_link.rstrip("/").endswith(cleaned_org_nr):
+            return [], None, "failed"
+
+        roles: list[CompanyRole] = []
+        seen_roles: set[tuple[str, str]] = set()
+
+        for rgroup in raw_data.get("rollegrupper", []):
+            for role in rgroup.get("roller", []):
+                # Ignore deregistered or deceased role holders
+                if role.get("avregistrert") is True:
+                    continue
+                person = role.get("person", {})
+                if isinstance(person, dict) and person.get("erDoed") is True:
+                    continue
+
+                # Extract person name parts
+                full_name = ""
+                birth_date = None
+                if isinstance(person, dict) and person.get("navn"):
+                    navn_dict = person["navn"]
+                    fornavn = (navn_dict.get("fornavn") or "").strip()
+                    mellomnavn = (navn_dict.get("mellomnavn") or "").strip()
+                    etternavn = (navn_dict.get("etternavn") or "").strip()
+                    full_name = " ".join([p for p in [fornavn, mellomnavn, etternavn] if p]).strip()
+                    birth_date = person.get("fodselsdato")
+
+                # Fallback: check if role holder is a registered entity (foretak/enhet)
+                if not full_name:
+                    enhet = role.get("enhet", {})
+                    if isinstance(enhet, dict):
+                        e_navn = enhet.get("navn")
+                        if isinstance(e_navn, list):
+                            full_name = " ".join([str(p).strip() for p in e_navn if p]).strip()
+                        elif e_navn:
+                            full_name = str(e_navn).strip()
+
+                if not full_name:
+                    continue
+
+                type_dict = role.get("type", {})
+                role_code = type_dict.get("kode", "")
+                role_title = type_dict.get("beskrivelse", role_code)
+
+                dedup_key = (role_code, full_name)
+                if dedup_key not in seen_roles:
+                    seen_roles.add(dedup_key)
+                    roles.append(
+                        CompanyRole(
+                            role_code=role_code,
+                            role_title=role_title,
+                            name=full_name,
+                            birth_date=birth_date,
+                            is_active=True,
+                        )
+                    )
+
+        payload_hash = self.compute_payload_hash(raw_data)
+        evidence = SourceEvidence(
+            source_name="Brønnøysund Register Centre (Roller)",
+            source_url=url,
+            retrieved_at=utc_now(),
+            response_hash=payload_hash,
+            status_code=response.status_code,
+        )
+
+        if not roles:
+            return [], evidence, "not_available"
+
+        return roles, evidence, "completed"
+
+    def fetch_financials(self, org_nr: str) -> tuple[Optional[FinancialAccounts], Optional[SourceEvidence], str]:
+        """
+        Fetch latest verified annual accounts from official Regnskapsregisteret API.
+        Extracts turnover/revenue (driftsinntekter) and annual net result (årsresultat).
+        Returns (financials, evidence, status) where status is:
+        - 'completed': Verified accounting records found.
+        - 'not_available': 404 or entity has no annual accounts in Regnskapsregisteret.
+        - 'blocked': Rate limited (HTTP 429) or forbidden.
+        - 'failed': Network error, timeout, or server error.
+        """
+        cleaned_org_nr = re.sub(r"\s+", "", str(org_nr))
+        if not re.fullmatch(r"^\d{9}$", cleaned_org_nr):
+            return None, None, "failed"
+
+        url = self.build_accounts_url(cleaned_org_nr)
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": self.user_agent,
+        }
+
+        try:
+            if self._http_client is not None:
+                response = self._http_client.get(url, headers=headers)
+            else:
+                with httpx.Client(timeout=self.timeout) as client:
+                    response = client.get(url, headers=headers)
+        except httpx.TimeoutException:
+            return None, None, "failed"
+        except (httpx.ConnectError, httpx.NetworkError, httpx.RequestError):
+            return None, None, "failed"
+        except Exception:
+            return None, None, "failed"
+
+        if response.status_code == 404:
+            return None, None, "not_available"
+        elif response.status_code == 429:
+            return None, None, "blocked"
+        elif response.status_code in (401, 403):
+            return None, None, "blocked"
+        elif response.is_error:
+            # Note: Certain financial entities (e.g. banks) file with Finanstilsynet and return 500 on Regnskapsregisteret
+            return None, None, "not_available" if response.status_code == 500 else "failed"
+
+        try:
+            raw_data = response.json()
+        except Exception:
+            return None, None, "failed"
+
+        if not isinstance(raw_data, list):
+            return None, None, "failed"
+
+        # Filter strictly for requested organization number
+        matching = [
+            item for item in raw_data
+            if isinstance(item, dict)
+            and str(item.get("virksomhet", {}).get("organisasjonsnummer", "")) == cleaned_org_nr
+        ]
+
+        if not matching:
+            return None, None, "not_available"
+
+        # Sort descending by accounting period end date (tilDato)
+        matching.sort(
+            key=lambda x: (
+                x.get("regnskapsperiode", {}).get("tilDato", ""),
+                1 if x.get("regnskapstype") == "KONSERN" else 0,
+            ),
+            reverse=True,
+        )
+
+        chosen = matching[0]
+        period = chosen.get("regnskapsperiode") or {}
+        til_dato = period.get("tilDato")
+        year = til_dato[:4] if til_dato and len(til_dato) >= 4 else str(chosen.get("journalnr", ""))[:4]
+        currency = chosen.get("valuta", "NOK")
+
+        res = chosen.get("resultatregnskapResultat") or {}
+        drifts = res.get("driftsresultat") or {}
+        driftsinntekter = drifts.get("driftsinntekter") or {}
+        revenue = driftsinntekter.get("sumDriftsinntekter")
+        if revenue is None:
+            revenue = driftsinntekter.get("salgsinntekter")
+
+        annual_result = res.get("aarsresultat")
+        operating_result = drifts.get("driftsresultat")
+
+        eiendeler = chosen.get("eiendeler") or {}
+        total_assets = eiendeler.get("sumEiendeler")
+
+        egenkapital_gjeld = chosen.get("egenkapitalGjeld") or {}
+        egenkapital = egenkapital_gjeld.get("egenkapital") or {}
+        total_equity = egenkapital.get("sumEgenkapital")
+
+        fin = FinancialAccounts(
+            financial_year=str(year) if year else "Unknown",
+            period_end=til_dato,
+            currency=str(currency),
+            revenue=float(revenue) if revenue is not None else None,
+            annual_result=float(annual_result) if annual_result is not None else None,
+            operating_result=float(operating_result) if operating_result is not None else None,
+            total_assets=float(total_assets) if total_assets is not None else None,
+            total_equity=float(total_equity) if total_equity is not None else None,
+        )
+
+        payload_hash = self.compute_payload_hash({"accounts": matching})
+        evidence = SourceEvidence(
+            source_name="Regnskapsregisteret (Annual Accounts)",
+            source_url=url,
+            retrieved_at=utc_now(),
+            response_hash=payload_hash,
+            status_code=response.status_code,
+        )
+
+        return fin, evidence, "completed"

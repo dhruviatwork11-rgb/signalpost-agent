@@ -329,10 +329,12 @@ def build_terminal_envelope(
                 }
                 for j in active_jobs
             ]
+            is_nav_ad = "nav.no" in first_job.advertisement_url or "arbeidsplassen" in first_job.advertisement_url
+            job_source_class = "public_employment_service" if is_nav_ad else "company_owned"
             evidence_list.append({
                 "id": ev_id,
                 "source_url": first_job.advertisement_url,
-                "source_class": "public_employment_service",
+                "source_class": job_source_class,
                 "retrieved_at": format_utc_z(evidence.retrieved_at),
                 "content_sha256": hashlib.sha256(first_job.job_title.encode("utf-8")).hexdigest(),
                 "claim_span": first_job.evidence_span or f"Active vacancy: {first_job.job_title}",
@@ -385,6 +387,377 @@ def build_terminal_envelope(
                 "availability": "not_available",
                 "confidence": 1.0,
                 "evidence_ids": [ev_id],
+            })
+
+        # 5. Corporate Management and Board Roles (Phase 1)
+        roles_status = getattr(profile, "roles_search_status", "completed")
+        active_roles = [r for r in (profile.management_roles or []) if r.is_active]
+        if active_roles:
+            roles_ev_id = f"ev-{len(evidence_list) + 1}"
+            roles_url = f"https://data.brreg.no/enhetsregisteret/api/enheter/{profile.org_nr}/roller"
+            roles_data = [
+                {
+                    "role_code": r.role_code,
+                    "role_title": r.role_title,
+                    "name": r.name,
+                    "birth_date": r.birth_date,
+                }
+                for r in active_roles
+            ]
+            evidence_list.append({
+                "id": roles_ev_id,
+                "source_url": roles_url,
+                "source_class": "official_registry",
+                "retrieved_at": format_utc_z(evidence.retrieved_at),
+                "content_sha256": hashlib.sha256(json.dumps(roles_data, sort_keys=True).encode("utf-8")).hexdigest(),
+                "claim_span": f"Official Roller registry for {profile.name}: {len(active_roles)} registered roles.",
+            })
+            claims.append({
+                "field": "management_roles",
+                "value": roles_data,
+                "availability": "available",
+                "confidence": 1.0,
+                "evidence_ids": [roles_ev_id],
+            })
+            # Explicit single-role claims for CEO / Daglig leder and Board Chair / Styreleder
+            daglig_leder = next((r.name for r in active_roles if r.role_code == "DAGL"), None)
+            styreleder = next((r.name for r in active_roles if r.role_code == "LEDE"), None)
+            if daglig_leder:
+                claims.append({
+                    "field": "daglig_leder",
+                    "value": daglig_leder,
+                    "availability": "available",
+                    "confidence": 1.0,
+                    "evidence_ids": [roles_ev_id],
+                })
+                claims.append({
+                    "field": "ceo",
+                    "value": daglig_leder,
+                    "availability": "available",
+                    "confidence": 1.0,
+                    "evidence_ids": [roles_ev_id],
+                })
+            else:
+                claims.append({
+                    "field": "daglig_leder",
+                    "value": None,
+                    "availability": "not_available",
+                    "confidence": 1.0,
+                    "evidence_ids": [roles_ev_id],
+                })
+                claims.append({
+                    "field": "ceo",
+                    "value": None,
+                    "availability": "not_available",
+                    "confidence": 1.0,
+                    "evidence_ids": [roles_ev_id],
+                })
+
+            if styreleder:
+                claims.append({
+                    "field": "styreleder",
+                    "value": styreleder,
+                    "availability": "available",
+                    "confidence": 1.0,
+                    "evidence_ids": [roles_ev_id],
+                })
+                claims.append({
+                    "field": "board_chair",
+                    "value": styreleder,
+                    "availability": "available",
+                    "confidence": 1.0,
+                    "evidence_ids": [roles_ev_id],
+                })
+            else:
+                claims.append({
+                    "field": "styreleder",
+                    "value": None,
+                    "availability": "not_available",
+                    "confidence": 1.0,
+                    "evidence_ids": [roles_ev_id],
+                })
+                claims.append({
+                    "field": "board_chair",
+                    "value": None,
+                    "availability": "not_available",
+                    "confidence": 1.0,
+                    "evidence_ids": [roles_ev_id],
+                })
+        elif roles_status == "blocked":
+            roles_ev_id = f"ev-{len(evidence_list) + 1}"
+            evidence_list.append({
+                "id": roles_ev_id,
+                "source_url": f"https://data.brreg.no/enhetsregisteret/api/enheter/{profile.org_nr}/roller",
+                "source_class": "official_registry",
+                "retrieved_at": format_utc_z(evidence.retrieved_at),
+                "content_sha256": hashlib.sha256(f"{profile.org_nr}_roles_blocked".encode("utf-8")).hexdigest(),
+                "claim_span": f"Official Roller registry rate-limited (HTTP 429) for {profile.name}.",
+            })
+            claims.append({
+                "field": "management_roles",
+                "value": None,
+                "availability": "blocked",
+                "confidence": 0.0,
+                "evidence_ids": [roles_ev_id],
+            })
+            claims.append({
+                "field": "daglig_leder",
+                "value": None,
+                "availability": "blocked",
+                "confidence": 0.0,
+                "evidence_ids": [roles_ev_id],
+            })
+            claims.append({
+                "field": "ceo",
+                "value": None,
+                "availability": "blocked",
+                "confidence": 0.0,
+                "evidence_ids": [roles_ev_id],
+            })
+            claims.append({
+                "field": "styreleder",
+                "value": None,
+                "availability": "blocked",
+                "confidence": 0.0,
+                "evidence_ids": [roles_ev_id],
+            })
+            claims.append({
+                "field": "board_chair",
+                "value": None,
+                "availability": "blocked",
+                "confidence": 0.0,
+                "evidence_ids": [roles_ev_id],
+            })
+        elif roles_status == "failed":
+            claims.append({
+                "field": "management_roles",
+                "value": None,
+                "availability": "failed",
+                "confidence": 0.0,
+                "evidence_ids": [],
+            })
+            claims.append({
+                "field": "daglig_leder",
+                "value": None,
+                "availability": "failed",
+                "confidence": 0.0,
+                "evidence_ids": [],
+            })
+            claims.append({
+                "field": "ceo",
+                "value": None,
+                "availability": "failed",
+                "confidence": 0.0,
+                "evidence_ids": [],
+            })
+            claims.append({
+                "field": "styreleder",
+                "value": None,
+                "availability": "failed",
+                "confidence": 0.0,
+                "evidence_ids": [],
+            })
+            claims.append({
+                "field": "board_chair",
+                "value": None,
+                "availability": "failed",
+                "confidence": 0.0,
+                "evidence_ids": [],
+            })
+        else:
+            # not_available (e.g. 0 roles registered)
+            roles_ev_id = f"ev-{len(evidence_list) + 1}"
+            evidence_list.append({
+                "id": roles_ev_id,
+                "source_url": f"https://data.brreg.no/enhetsregisteret/api/enheter/{profile.org_nr}/roller",
+                "source_class": "official_registry",
+                "retrieved_at": format_utc_z(evidence.retrieved_at),
+                "content_sha256": hashlib.sha256(f"{profile.org_nr}_roles_none".encode("utf-8")).hexdigest(),
+                "claim_span": f"Official Roller registry checked for {profile.name}: 0 active roles registered.",
+            })
+            claims.append({
+                "field": "management_roles",
+                "value": None,
+                "availability": "not_available",
+                "confidence": 1.0,
+                "evidence_ids": [roles_ev_id],
+            })
+            claims.append({
+                "field": "daglig_leder",
+                "value": None,
+                "availability": "not_available",
+                "confidence": 1.0,
+                "evidence_ids": [roles_ev_id],
+            })
+            claims.append({
+                "field": "ceo",
+                "value": None,
+                "availability": "not_available",
+                "confidence": 1.0,
+                "evidence_ids": [roles_ev_id],
+            })
+            claims.append({
+                "field": "styreleder",
+                "value": None,
+                "availability": "not_available",
+                "confidence": 1.0,
+                "evidence_ids": [roles_ev_id],
+            })
+            claims.append({
+                "field": "board_chair",
+                "value": None,
+                "availability": "not_available",
+                "confidence": 1.0,
+                "evidence_ids": [roles_ev_id],
+            })
+
+        # 6. Financial Accounts and Figures (Phase 4)
+        fin_status = getattr(profile, "financials_search_status", "completed")
+        fin = profile.financial_accounts
+        if fin is not None:
+            fin_ev_id = f"ev-{len(evidence_list) + 1}"
+            fin_url = f"https://data.brreg.no/regnskapsregisteret/regnskap/{profile.org_nr}"
+            fin_dict = {
+                "financial_year": fin.financial_year,
+                "period_end": fin.period_end,
+                "currency": fin.currency,
+                "revenue": fin.revenue,
+                "annual_result": fin.annual_result,
+                "operating_result": fin.operating_result,
+                "total_assets": fin.total_assets,
+                "total_equity": fin.total_equity,
+            }
+            evidence_list.append({
+                "id": fin_ev_id,
+                "source_url": fin_url,
+                "source_class": "official_registry",
+                "retrieved_at": format_utc_z(evidence.retrieved_at),
+                "content_sha256": hashlib.sha256(json.dumps(fin_dict, sort_keys=True).encode("utf-8")).hexdigest(),
+                "claim_span": f"Official Regnskapsregisteret annual accounts ({fin.financial_year}) for {profile.name}: Revenue {fin.revenue} {fin.currency}, Result {fin.annual_result} {fin.currency}.",
+            })
+            claims.append({
+                "field": "financial_accounts",
+                "value": fin_dict,
+                "availability": "available",
+                "confidence": 1.0,
+                "evidence_ids": [fin_ev_id],
+            })
+            if fin.revenue is not None:
+                claims.append({
+                    "field": "annual_revenue",
+                    "value": fin.revenue,
+                    "availability": "available",
+                    "confidence": 1.0,
+                    "evidence_ids": [fin_ev_id],
+                })
+            else:
+                claims.append({
+                    "field": "annual_revenue",
+                    "value": None,
+                    "availability": "not_available",
+                    "confidence": 1.0,
+                    "evidence_ids": [fin_ev_id],
+                })
+            if fin.annual_result is not None:
+                claims.append({
+                    "field": "annual_net_result",
+                    "value": fin.annual_result,
+                    "availability": "available",
+                    "confidence": 1.0,
+                    "evidence_ids": [fin_ev_id],
+                })
+            else:
+                claims.append({
+                    "field": "annual_net_result",
+                    "value": None,
+                    "availability": "not_available",
+                    "confidence": 1.0,
+                    "evidence_ids": [fin_ev_id],
+                })
+        elif fin_status == "blocked":
+            fin_ev_id = f"ev-{len(evidence_list) + 1}"
+            evidence_list.append({
+                "id": fin_ev_id,
+                "source_url": f"https://data.brreg.no/regnskapsregisteret/regnskap/{profile.org_nr}",
+                "source_class": "official_registry",
+                "retrieved_at": format_utc_z(evidence.retrieved_at),
+                "content_sha256": hashlib.sha256(f"{profile.org_nr}_financials_blocked".encode("utf-8")).hexdigest(),
+                "claim_span": f"Official Regnskapsregisteret rate-limited (HTTP 429) for {profile.name}.",
+            })
+            claims.append({
+                "field": "financial_accounts",
+                "value": None,
+                "availability": "blocked",
+                "confidence": 0.0,
+                "evidence_ids": [fin_ev_id],
+            })
+            claims.append({
+                "field": "annual_revenue",
+                "value": None,
+                "availability": "blocked",
+                "confidence": 0.0,
+                "evidence_ids": [fin_ev_id],
+            })
+            claims.append({
+                "field": "annual_net_result",
+                "value": None,
+                "availability": "blocked",
+                "confidence": 0.0,
+                "evidence_ids": [fin_ev_id],
+            })
+        elif fin_status == "failed":
+            claims.append({
+                "field": "financial_accounts",
+                "value": None,
+                "availability": "failed",
+                "confidence": 0.0,
+                "evidence_ids": [],
+            })
+            claims.append({
+                "field": "annual_revenue",
+                "value": None,
+                "availability": "failed",
+                "confidence": 0.0,
+                "evidence_ids": [],
+            })
+            claims.append({
+                "field": "annual_net_result",
+                "value": None,
+                "availability": "failed",
+                "confidence": 0.0,
+                "evidence_ids": [],
+            })
+        else:
+            # not_available (e.g. no annual accounts filed with Regnskapsregisteret)
+            fin_ev_id = f"ev-{len(evidence_list) + 1}"
+            evidence_list.append({
+                "id": fin_ev_id,
+                "source_url": f"https://data.brreg.no/regnskapsregisteret/regnskap/{profile.org_nr}",
+                "source_class": "official_registry",
+                "retrieved_at": format_utc_z(evidence.retrieved_at),
+                "content_sha256": hashlib.sha256(f"{profile.org_nr}_financials_none".encode("utf-8")).hexdigest(),
+                "claim_span": f"Official Regnskapsregisteret checked for {profile.name}: no annual accounts available.",
+            })
+            claims.append({
+                "field": "financial_accounts",
+                "value": None,
+                "availability": "not_available",
+                "confidence": 1.0,
+                "evidence_ids": [fin_ev_id],
+            })
+            claims.append({
+                "field": "annual_revenue",
+                "value": None,
+                "availability": "not_available",
+                "confidence": 1.0,
+                "evidence_ids": [fin_ev_id],
+            })
+            claims.append({
+                "field": "annual_net_result",
+                "value": None,
+                "availability": "not_available",
+                "confidence": 1.0,
+                "evidence_ids": [fin_ev_id],
             })
 
     elif terminal_status == "not_found":
@@ -648,6 +1021,45 @@ class BatchRunner:
                 except Exception:
                     profile.job_postings = []
                     profile.job_search_status = "failed"
+
+                # 3B. Career-page Schema.org JobPosting fallback when NAV is blocked or failed
+                if (
+                    profile.job_search_status in ("blocked", "failed")
+                    and profile.verified_website is not None
+                    and profile.verified_website.is_verified
+                ):
+                    try:
+                        career_jobs = self.job_verifier.discover_career_vacancies(
+                            website_url=profile.verified_website.final_url or profile.official_website,
+                            legal_name=profile.name,
+                            org_nr=profile.org_nr,
+                            http_client=self.website_verifier._http_client,
+                        )
+                        if career_jobs:
+                            profile.job_postings = career_jobs
+                            profile.job_search_status = "completed"
+                    except Exception:
+                        pass
+
+                # 4. Corporate management and board roles (Phase 1)
+                requests_count += 1
+                try:
+                    roles, r_ev, r_status = self.client.fetch_roles(profile.org_nr)
+                    profile.management_roles = roles
+                    profile.roles_search_status = r_status
+                except Exception:
+                    profile.management_roles = []
+                    profile.roles_search_status = "failed"
+
+                # 5. Financial accounts and results (Phase 4)
+                requests_count += 1
+                try:
+                    fin, f_ev, f_status = self.client.fetch_financials(profile.org_nr)
+                    profile.financial_accounts = fin
+                    profile.financials_search_status = f_status
+                except Exception:
+                    profile.financial_accounts = None
+                    profile.financials_search_status = "failed"
 
             # Transactionally persist and check for historical diffs
             version, changes = self.db.upsert_company_profile(profile, evidence)

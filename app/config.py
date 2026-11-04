@@ -15,6 +15,12 @@ BRREG_API_BASE_URL: str = os.getenv(
     "https://data.brreg.no/enhetsregisteret/api",
 ).rstrip("/")
 
+# Regnskapsregisteret API base URL
+REGNSKAP_API_BASE_URL: str = os.getenv(
+    "REGNSKAP_API_BASE_URL",
+    "https://data.brreg.no/regnskapsregisteret/regnskap",
+).rstrip("/")
+
 # SQLite database path (defaults to data/signalpost.db)
 _db_env = os.getenv("DATABASE_PATH", "data/signalpost.db")
 DATABASE_PATH: Path = (

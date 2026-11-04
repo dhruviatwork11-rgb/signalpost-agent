@@ -6,7 +6,7 @@ import re
 import threading
 import time
 from typing import Any, Optional
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urljoin
 import httpx
 
 from app.config import REQUEST_TIMEOUT_SECONDS, USER_AGENT
@@ -593,3 +593,145 @@ class JobVerifier:
             query_term=effective_term,
             error_message=last_error,
         )
+
+    def discover_career_vacancies(
+        self,
+        website_url: str,
+        legal_name: str,
+        org_nr: str,
+        http_client: Optional[httpx.Client] = None,
+        max_results: int = 10,
+    ) -> Optional[JobPostingList]:
+        """
+        Discover individual job vacancies on company career pages via Schema.org JobPosting structured data.
+        Serves as a reliable fallback when NAV Arbeidsplassen is rate-limited or blocked.
+        Ensures employer matches target company and filters expired vacancies.
+        """
+        if not website_url:
+            return None
+
+        career_paths = ["/karriere", "/careers", "/ledige-stillinger", "/jobb"]
+        client = http_client or self._http_client
+
+        headers = {
+            "Accept": "text/html,application/xhtml+xml",
+            "User-Agent": self.user_agent,
+        }
+
+        now_date_str = utc_now().strftime("%Y-%m-%d")
+
+        for path in career_paths:
+            cand_url = urljoin(website_url, path)
+            try:
+                if client is not None:
+                    resp = client.get(cand_url, headers=headers)
+                else:
+                    with httpx.Client(timeout=4.0, follow_redirects=True) as hclient:
+                        resp = hclient.get(cand_url, headers=headers)
+            except Exception:
+                continue
+
+            if resp.status_code != 200 or not resp.text:
+                continue
+
+            html = resp.text[:1048576]  # Max 1MB
+            json_ld_blocks = re.findall(
+                r'<script[^>]+type=[\'"]application/ld\+json[\'"][^>]*>(.*?)</script>',
+                html,
+                re.DOTALL | re.IGNORECASE,
+            )
+
+            candidate_postings: list[JobPosting] = []
+
+            for block in json_ld_blocks:
+                try:
+                    data = json.loads(block.strip())
+                except Exception:
+                    continue
+
+                items = []
+                if isinstance(data, list):
+                    items = data
+                elif isinstance(data, dict):
+                    if "@graph" in data and isinstance(data["@graph"], list):
+                        items = data["@graph"]
+                    else:
+                        items = [data]
+
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = item.get("@type")
+                    if item_type != "JobPosting" and (not isinstance(item_type, list) or "JobPosting" not in item_type):
+                        continue
+
+                    title = str(item.get("title") or item.get("name") or "").strip()
+                    if not title or len(title) < 3:
+                        continue
+
+                    # Validate employer / hiringOrganization
+                    hiring_org = item.get("hiringOrganization")
+                    employer_name = None
+                    if isinstance(hiring_org, dict):
+                        employer_name = (hiring_org.get("name") or "").strip()
+                    elif isinstance(hiring_org, str):
+                        employer_name = hiring_org.strip()
+
+                    # Verify employer match if employer name is provided
+                    if employer_name:
+                        if not self.verify_employer_match(employer_name, legal_name):
+                            continue
+                    else:
+                        employer_name = legal_name
+
+                    # Deadline / validThrough check
+                    valid_through = item.get("validThrough")
+                    deadline_str = str(valid_through)[:10] if valid_through else None
+                    if deadline_str and deadline_str < now_date_str:
+                        # Expired vacancy
+                        continue
+
+                    # Publication date / datePosted
+                    date_posted = item.get("datePosted")
+                    pub_date = str(date_posted)[:10] if date_posted else None
+
+                    # Advertisement URL
+                    raw_ad_url = item.get("url") or item.get("mainEntityOfPage") or cand_url
+                    ad_url = urljoin(cand_url, str(raw_ad_url).strip())
+
+                    # Location
+                    loc_val = item.get("jobLocation")
+                    loc_str = None
+                    if isinstance(loc_val, dict):
+                        addr = loc_val.get("address")
+                        if isinstance(addr, dict):
+                            loc_str = addr.get("addressLocality") or addr.get("streetAddress")
+                        elif isinstance(addr, str):
+                            loc_str = addr
+                    elif isinstance(loc_val, str):
+                        loc_str = loc_val
+
+                    candidate_postings.append(
+                        JobPosting(
+                            job_title=title,
+                            employer_name=employer_name,
+                            employer_org_nr=org_nr,
+                            advertisement_url=ad_url,
+                            location=loc_str,
+                            publication_date=pub_date,
+                            deadline_date=deadline_str,
+                            is_active=True,
+                            evidence_span=f"Verified Schema.org JobPosting on {cand_url}: '{title}' for '{employer_name}'.",
+                        )
+                    )
+
+            if candidate_postings:
+                return JobPostingList(
+                    candidate_postings[:max_results],
+                    status="completed",
+                    search_url=cand_url,
+                    query_term=legal_name,
+                    error_message=None,
+                )
+
+        return None

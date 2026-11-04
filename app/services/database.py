@@ -490,6 +490,16 @@ class DatabaseService:
                         "INSERT INTO verified_assets (org_nr, asset_type, asset_data, verification_status, created_at) VALUES (?, ?, ?, ?, ?)",
                         (profile.org_nr, "job", jp.model_dump_json(), "active" if jp.is_active else "inactive", now_iso),
                     )
+                for mr in profile.management_roles:
+                    cursor.execute(
+                        "INSERT INTO verified_assets (org_nr, asset_type, asset_data, verification_status, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (profile.org_nr, f"role_{mr.role_code.lower()}", mr.model_dump_json(), "active" if mr.is_active else "inactive", now_iso),
+                    )
+                if profile.financial_accounts:
+                    cursor.execute(
+                        "INSERT INTO verified_assets (org_nr, asset_type, asset_data, verification_status, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (profile.org_nr, "financials", profile.financial_accounts.model_dump_json(), "verified", now_iso),
+                    )
 
                 return target_version, changes
         finally:
