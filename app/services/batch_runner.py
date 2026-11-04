@@ -400,7 +400,6 @@ def build_terminal_envelope(
                     "role_code": r.role_code,
                     "role_title": r.role_title,
                     "name": r.name,
-                    "birth_date": r.birth_date,
                 }
                 for r in active_roles
             ]
@@ -620,6 +619,8 @@ def build_terminal_envelope(
             fin_dict = {
                 "financial_year": fin.financial_year,
                 "period_end": fin.period_end,
+                "account_type": fin.account_type,
+                "is_consolidated": fin.is_consolidated,
                 "currency": fin.currency,
                 "revenue": fin.revenue,
                 "annual_result": fin.annual_result,
@@ -627,13 +628,14 @@ def build_terminal_envelope(
                 "total_assets": fin.total_assets,
                 "total_equity": fin.total_equity,
             }
+            type_label = "consolidated group" if fin.is_consolidated else "individual company"
             evidence_list.append({
                 "id": fin_ev_id,
                 "source_url": fin_url,
                 "source_class": "official_registry",
                 "retrieved_at": format_utc_z(evidence.retrieved_at),
                 "content_sha256": hashlib.sha256(json.dumps(fin_dict, sort_keys=True).encode("utf-8")).hexdigest(),
-                "claim_span": f"Official Regnskapsregisteret annual accounts ({fin.financial_year}) for {profile.name}: Revenue {fin.revenue} {fin.currency}, Result {fin.annual_result} {fin.currency}.",
+                "claim_span": f"Official Regnskapsregisteret {type_label} annual accounts ({fin.account_type}, {fin.financial_year}) for {profile.name}: Revenue {fin.revenue} {fin.currency}, Result {fin.annual_result} {fin.currency}.",
             })
             claims.append({
                 "field": "financial_accounts",
@@ -706,26 +708,38 @@ def build_terminal_envelope(
                 "evidence_ids": [fin_ev_id],
             })
         elif fin_status == "failed":
+            fin_ev_id = f"ev-{len(evidence_list) + 1}"
+            evidence_list.append({
+                "id": fin_ev_id,
+                "source_url": f"https://data.brreg.no/regnskapsregisteret/regnskap/{profile.org_nr}",
+                "source_class": "official_registry",
+                "retrieved_at": format_utc_z(evidence.retrieved_at),
+                "content_sha256": hashlib.sha256(f"{profile.org_nr}_financials_failed".encode("utf-8")).hexdigest(),
+                "claim_span": f"Official Regnskapsregisteret lookup for {profile.name} failed due to an upstream server error or timeout.",
+            })
             claims.append({
                 "field": "financial_accounts",
                 "value": None,
                 "availability": "failed",
+                "error": "Upstream server or network failure querying Regnskapsregisteret",
                 "confidence": 0.0,
-                "evidence_ids": [],
+                "evidence_ids": [fin_ev_id],
             })
             claims.append({
                 "field": "annual_revenue",
                 "value": None,
                 "availability": "failed",
+                "error": "Upstream server or network failure querying Regnskapsregisteret",
                 "confidence": 0.0,
-                "evidence_ids": [],
+                "evidence_ids": [fin_ev_id],
             })
             claims.append({
                 "field": "annual_net_result",
                 "value": None,
                 "availability": "failed",
+                "error": "Upstream server or network failure querying Regnskapsregisteret",
                 "confidence": 0.0,
-                "evidence_ids": [],
+                "evidence_ids": [fin_ev_id],
             })
         else:
             # not_available (e.g. no annual accounts filed with Regnskapsregisteret)

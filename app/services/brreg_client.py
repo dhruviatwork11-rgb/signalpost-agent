@@ -357,9 +357,17 @@ class BrregClient:
 
         roles: list[CompanyRole] = []
         seen_roles: set[tuple[str, str]] = set()
+        allowed_governance_codes = {"DAGL", "LEDE", "NEST", "MEDL", "VARA", "INNH"}
 
         for rgroup in raw_data.get("rollegrupper", []):
             for role in rgroup.get("roller", []):
+                # Filter strictly to authorized corporate governance roles (exclude REVI, REGN, etc.)
+                type_dict = role.get("type", {})
+                role_code = (type_dict.get("kode") or "").upper().strip()
+                if role_code not in allowed_governance_codes:
+                    continue
+                role_title = type_dict.get("beskrivelse", role_code)
+
                 # Ignore deregistered or deceased role holders
                 if role.get("avregistrert") is True:
                     continue
@@ -367,16 +375,14 @@ class BrregClient:
                 if isinstance(person, dict) and person.get("erDoed") is True:
                     continue
 
-                # Extract person name parts
+                # Extract person name parts without collecting dates of birth (GDPR data minimization)
                 full_name = ""
-                birth_date = None
                 if isinstance(person, dict) and person.get("navn"):
                     navn_dict = person["navn"]
                     fornavn = (navn_dict.get("fornavn") or "").strip()
                     mellomnavn = (navn_dict.get("mellomnavn") or "").strip()
                     etternavn = (navn_dict.get("etternavn") or "").strip()
                     full_name = " ".join([p for p in [fornavn, mellomnavn, etternavn] if p]).strip()
-                    birth_date = person.get("fodselsdato")
 
                 # Fallback: check if role holder is a registered entity (foretak/enhet)
                 if not full_name:
@@ -391,10 +397,6 @@ class BrregClient:
                 if not full_name:
                     continue
 
-                type_dict = role.get("type", {})
-                role_code = type_dict.get("kode", "")
-                role_title = type_dict.get("beskrivelse", role_code)
-
                 dedup_key = (role_code, full_name)
                 if dedup_key not in seen_roles:
                     seen_roles.add(dedup_key)
@@ -403,7 +405,6 @@ class BrregClient:
                             role_code=role_code,
                             role_title=role_title,
                             name=full_name,
-                            birth_date=birth_date,
                             is_active=True,
                         )
                     )
@@ -462,8 +463,8 @@ class BrregClient:
         elif response.status_code in (401, 403):
             return None, None, "blocked"
         elif response.is_error:
-            # Note: Certain financial entities (e.g. banks) file with Finanstilsynet and return 500 on Regnskapsregisteret
-            return None, None, "not_available" if response.status_code == 500 else "failed"
+            # Server errors (HTTP 5xx) or other client errors are upstream failures, not missing filings
+            return None, None, "failed"
 
         try:
             raw_data = response.json()
@@ -493,6 +494,8 @@ class BrregClient:
         )
 
         chosen = matching[0]
+        account_type = str(chosen.get("regnskapstype") or "SELSKAP").strip().upper()
+        is_consolidated = (account_type == "KONSERN")
         period = chosen.get("regnskapsperiode") or {}
         til_dato = period.get("tilDato")
         year = til_dato[:4] if til_dato and len(til_dato) >= 4 else str(chosen.get("journalnr", ""))[:4]
@@ -518,6 +521,8 @@ class BrregClient:
         fin = FinancialAccounts(
             financial_year=str(year) if year else "Unknown",
             period_end=til_dato,
+            account_type=account_type,
+            is_consolidated=is_consolidated,
             currency=str(currency),
             revenue=float(revenue) if revenue is not None else None,
             annual_result=float(annual_result) if annual_result is not None else None,

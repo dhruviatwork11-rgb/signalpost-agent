@@ -128,7 +128,6 @@ class CompanyRole(BaseModel):
     role_code: str = Field(..., description="Role code, e.g. DAGL, LEDE, MEDL")
     role_title: str = Field(..., description="Role description, e.g. Daglig leder, Styrets leder")
     name: str = Field(..., description="Full name of person holding role")
-    birth_date: Optional[str] = Field(default=None, description="Birth date (YYYY-MM-DD) if available")
     is_active: bool = Field(default=True, description="True if role is active")
 
 
@@ -139,6 +138,8 @@ class FinancialAccounts(BaseModel):
 
     financial_year: str = Field(..., description="Fiscal year (YYYY)")
     period_end: Optional[str] = Field(default=None, description="Period end date (YYYY-MM-DD)")
+    account_type: str = Field(default="SELSKAP", description="Account type from registry (e.g. KONSERN, SELSKAP)")
+    is_consolidated: bool = Field(default=False, description="True if accounts are consolidated corporate group accounts (KONSERN)")
     currency: str = Field(default="NOK", description="Reporting currency (e.g. NOK, USD)")
     revenue: Optional[float] = Field(default=None, description="Total sales/operating revenue (driftsinntekter)")
     annual_result: Optional[float] = Field(default=None, description="Annual net profit/loss (aarsresultat)")
@@ -315,11 +316,14 @@ class CompanyProfile(BaseModel):
             fa = self.financial_accounts
             fin_items = []
             if fa.revenue is not None:
-                fin_items.append(f"revenue {fa.revenue:,.0f} {fa.currency}")
+                rev_prefix = "consolidated group revenue" if fa.is_consolidated else "revenue"
+                fin_items.append(f"{rev_prefix} {fa.revenue:,.0f} {fa.currency}")
             if fa.annual_result is not None:
-                fin_items.append(f"annual net result {fa.annual_result:,.0f} {fa.currency}")
+                res_prefix = "consolidated net result" if fa.is_consolidated else "annual net result"
+                fin_items.append(f"{res_prefix} {fa.annual_result:,.0f} {fa.currency}")
             if fin_items:
-                parts.append(f"Financial highlights ({fa.financial_year}): " + "; ".join(fin_items) + ".")
+                type_desc = f"{fa.account_type} ({'consolidated' if fa.is_consolidated else 'company'})"
+                parts.append(f"Financial highlights ({fa.financial_year}, {type_desc}): " + "; ".join(fin_items) + ".")
 
         extra = []
         if self.job_postings:

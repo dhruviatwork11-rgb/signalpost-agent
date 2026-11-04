@@ -244,10 +244,10 @@ def test_fetch_financials_error_handling():
     assert status == "blocked"
     assert fin is None
 
-    # 500 -> not_available (e.g. DNB Bank filing with Finanstilsynet)
+    # 500 -> failed (server error)
     c_500 = BrregClient(http_client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(500))))
     fin, ev, status = c_500.fetch_financials("123456789")
-    assert status == "not_available"
+    assert status == "failed"
     assert fin is None
 
 
@@ -457,4 +457,6 @@ def test_build_terminal_envelope_v2_5_claims():
     assert "vacancyies" not in summary
     assert "Per Gunnar Tronsli (Daglig leder/CEO)" in summary
     assert "Pål Egil Rønn (Styreleder/Board Chair)" in summary
-    assert "Financial highlights (2025): revenue 3,912,343,000 NOK; annual net result 383,442,000 NOK" in summary
+    assert "Financial highlights (2025" in summary
+    assert "revenue 3,912,343,000 NOK" in summary
+    assert "annual net result 383,442,000 NOK" in summary
