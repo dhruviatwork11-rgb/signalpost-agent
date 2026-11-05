@@ -347,13 +347,22 @@ def build_terminal_envelope(
                 "evidence_ids": [ev_id],
             })
         elif job_status == "blocked":
+            website_checked = (profile.verified_website is not None and profile.verified_website.is_verified)
+            if website_checked:
+                span_text = (
+                    f"Primary national register (Arbeidsplassen) was rate-limited (HTTP 429) for {profile.name}. "
+                    f"Verified official corporate website checked: 0 active vacancies found. Source coverage was blocked."
+                )
+            else:
+                span_text = f"Official Arbeidsplassen register rate-limited (HTTP 429) for {profile.name}. Source not successfully checked."
+
             evidence_list.append({
                 "id": ev_id,
                 "source_url": "https://arbeidsplassen.nav.no/stillinger",
                 "source_class": "public_employment_service",
                 "retrieved_at": format_utc_z(evidence.retrieved_at),
                 "content_sha256": hashlib.sha256(f"{profile.org_nr}_blocked".encode("utf-8")).hexdigest(),
-                "claim_span": f"Official Arbeidsplassen register rate-limited (HTTP 429) for {profile.name}. Source not successfully checked.",
+                "claim_span": span_text,
             })
             claims.append({
                 "field": "job_postings",
@@ -373,13 +382,19 @@ def build_terminal_envelope(
             errors_list.append(f"Job search failed for {profile.name}")
         else:
             # Completed with 0 vacancies
+            website_checked = (profile.verified_website is not None and profile.verified_website.is_verified)
+            if website_checked:
+                span_text = f"Official Arbeidsplassen register and verified corporate website checked for {profile.name}: 0 active vacancies found."
+            else:
+                span_text = f"Official Arbeidsplassen register checked for {profile.name}: 0 active vacancies found."
+
             evidence_list.append({
                 "id": ev_id,
                 "source_url": "https://arbeidsplassen.nav.no/stillinger",
                 "source_class": "public_employment_service",
                 "retrieved_at": format_utc_z(evidence.retrieved_at),
                 "content_sha256": hashlib.sha256(f"{profile.org_nr}_no_jobs".encode("utf-8")).hexdigest(),
-                "claim_span": f"Official Arbeidsplassen register checked for {profile.name}: 0 active vacancies found.",
+                "claim_span": span_text,
             })
             claims.append({
                 "field": "job_postings",
@@ -1147,10 +1162,11 @@ class BatchRunner:
         output_path: Path | str,
         report_path: Optional[Path | str] = None,
         run_id: Optional[str] = None,
+        resume: bool = True,
     ) -> dict[str, Any]:
         """
         Execute batch processing across all input organizations and write
-        one JSONL terminal envelope per input.
+        one JSONL terminal envelope per input. Supports resilient batch resumption.
         """
         overall_start = time.monotonic()
         run_started_at = utc_now()
@@ -1163,17 +1179,38 @@ class BatchRunner:
         results_by_org: dict[str, dict[str, Any]] = {}
         total_requests = 0
 
-        # Execute with bounded concurrency for unique orgs
-        with ThreadPoolExecutor(max_workers=self.workers) as executor:
-            future_to_org = {
-                executor.submit(self.process_company, org, run_id): org
-                for org in unique_orgs
-            }
-            for future in as_completed(future_to_org):
-                envelope = future.result()
-                org = envelope["organisation_number"]
-                results_by_org[org] = envelope
-                total_requests += envelope["operations"]["requests"]
+        # Resumable batch processing: inspect existing output file if resume is requested
+        out_file = Path(output_path)
+        if resume and out_file.exists():
+            try:
+                with out_file.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            env = json.loads(line)
+                            env_org = env.get("organisation_number")
+                            term_status = env.get("run", {}).get("terminal_status")
+                            # Only reuse completed or verified not_found envelopes
+                            if env_org and term_status in ("completed", "not_found"):
+                                results_by_org[env_org] = env
+            except Exception:
+                pass
+
+        # Identify organizations still needing execution
+        orgs_to_process = [org for org in unique_orgs if org not in results_by_org]
+
+        # Execute with bounded concurrency for pending orgs
+        if orgs_to_process:
+            with ThreadPoolExecutor(max_workers=self.workers) as executor:
+                future_to_org = {
+                    executor.submit(self.process_company, org, run_id): org
+                    for org in orgs_to_process
+                }
+                for future in as_completed(future_to_org):
+                    envelope = future.result()
+                    org = envelope["organisation_number"]
+                    results_by_org[org] = envelope
+                    total_requests += envelope["operations"]["requests"]
 
         # Preserve exact input order and duplicate rows (1 envelope per input entry)
         ordered_envelopes = [copy.deepcopy(results_by_org[org]) for org in orgs]
@@ -1185,7 +1222,6 @@ class BatchRunner:
             )
 
         # Write output JSONL atomically
-        out_file = Path(output_path)
         out_file.parent.mkdir(parents=True, exist_ok=True)
         tmp_out = out_file.with_suffix(".tmp")
         with tmp_out.open("w", encoding="utf-8") as f:

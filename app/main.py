@@ -243,6 +243,7 @@ def run_batch_cli(
     workers: int = 4,
     run_id: Optional[str] = None,
     db_path: Path | str = DATABASE_PATH,
+    resume: bool = True,
 ) -> int:
     """Run batch processor compliant with official evaluation contract."""
     try:
@@ -252,6 +253,7 @@ def run_batch_cli(
             output_path=output_path,
             report_path=report_path,
             run_id=run_id,
+            resume=resume,
         )
         print(f"Batch completed in {report['elapsed_seconds']}s.")
         print(
@@ -309,6 +311,12 @@ def main() -> None:
     batch_parser.add_argument(
         "--run-id", help="Optional identifier for the run"
     )
+    batch_parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Resume previously interrupted batch from output checkpoint (default: True)",
+    )
 
     # import-mock command
     import_parser = subparsers.add_parser(
@@ -340,6 +348,7 @@ def main() -> None:
             workers=args.workers,
             run_id=args.run_id,
             db_path=args.db,
+            resume=args.resume,
         )
     elif args.command == "import-mock":
         exit_code = import_mock_data(Path(args.file))

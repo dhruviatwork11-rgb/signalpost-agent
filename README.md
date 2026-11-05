@@ -59,6 +59,7 @@ python -m app.main batch --input data/smoke_test_100_companies.json --output out
 - `--report`, `-r`: Optional destination for the machine-readable run summary (`.json`).
 - `--workers`, `-w`: Bounded worker threads (default `4`, max `8`).
 - `--run-id`: Optional identifier for the evaluation run.
+- `--resume / --no-resume`: Resilient batch resumption; resumes interrupted batches from existing completed checkpoint envelopes without redundant queries (default: `--resume`).
 
 ---
 
@@ -272,7 +273,7 @@ Test coverage includes:
 | **A. Legal Company & Website Ownership** | [`app/services/website_verifier.py`](file:///d:/signalpost%20agent/app/services/website_verifier.py) | Follows redirects safely, records final URL, scans for 9-digit org nr and exact legal name. Flags unverified parent/group domains as `ambiguous` rather than asserting false ownership. |
 | **B. Social Account Verification** | [`app/services/social_verifier.py`](file:///d:/signalpost%20agent/app/services/social_verifier.py) | Verifies handles independently against legal entity name. Rejects share buttons (`sharer.php`), template placeholders (`yourcompany`), agency credits (`wix`, `squarespace`), and parent group accounts. |
 | **C. News Article Verification** | [`app/services/news_verifier.py`](file:///d:/signalpost%20agent/app/services/news_verifier.py) | Extracts genuine news from RSS and JSON-LD. Enforces explicit publication date (`datePublished`), rejects `dateModified` / retrieval timestamps, rejects navigation labels ("See more news"), and deduplicates stories. |
-| **D. Individual Job Advertisements** | [`app/services/job_verifier.py`](file:///d:/signalpost%20agent/app/services/job_verifier.py) | Connects to official NAV Arbeidsplassen public register. Verifies employer entity match, extracts individual vacancy URLs (`/stillinger/stilling/{uuid}`), location, deadline, and rejects generic career landing pages. |
+| **D. Individual Job Advertisements** | [`app/services/job_verifier.py`](file:///d:/signalpost%20agent/app/services/job_verifier.py) | Connects to official NAV Arbeidsplassen public register with adaptive circuit breaker & serialized pacing; queries verified corporate career pages and 7 major ATS platforms (Teamtailor, Webcruiter, Recman, ReachMee, Easycruit, Jobbnorge, Workbuster). Unescapes HTML entities, resolves generic calls-to-action ("les mer og søk her") to clean titles from URL slugs, verifies employer match, and enforces strict availability semantics (`available`, `not_available`, `blocked`). |
 
 ---
 

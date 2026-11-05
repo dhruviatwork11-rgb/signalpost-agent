@@ -1,6 +1,7 @@
 """Service for discovering and verifying individual job advertisements from official sources."""
 
 from datetime import datetime, timezone, timedelta
+import html
 import json
 import re
 import threading
@@ -50,6 +51,7 @@ ATS_DOMAINS = [
     "easycruit.com",
     "jobbnorge.no",
     "workbuster.com",
+    "workbuster.se",
 ]
 
 # Keywords indicating career links in navigation menus
@@ -120,6 +122,11 @@ class JobVerifier:
     _circuit_blocked_until: float = 0.0
     _probe_in_flight: bool = False
 
+    # Polite per-host spacing for corporate websites & ATS
+    _host_lock = threading.Lock()
+    _host_last_request_ts: dict[str, float] = {}
+    _min_host_interval: float = 0.5
+
     # Observability metrics
     _nav_requests_sent: int = 0
     _nav_429_received: int = 0
@@ -176,6 +183,76 @@ class JobVerifier:
             cls._nav_requests_sent = 0
             cls._nav_429_received = 0
             cls._nav_circuit_skips = 0
+        with cls._host_lock:
+            cls._host_last_request_ts.clear()
+
+    @classmethod
+    def _pace_host(cls, url: str) -> None:
+        """Apply polite per-host spacing to avoid flooding a corporate web server."""
+        try:
+            netloc = urlparse(url).netloc.lower()
+            if not netloc:
+                return
+            with cls._host_lock:
+                now = time.monotonic()
+                last_ts = cls._host_last_request_ts.get(netloc, 0.0)
+                elapsed = now - last_ts
+                wait_time = cls._min_host_interval - elapsed
+                if wait_time > 0:
+                    time.sleep(wait_time)
+                cls._host_last_request_ts[netloc] = time.monotonic()
+        except Exception:
+            pass
+
+    @staticmethod
+    def extract_title_from_slug_or_text(raw_text: str, url: str) -> str:
+        """
+        Extract clean job vacancy title, unescaping HTML entities and
+        resolving to URL slug when anchor text is a generic call-to-action.
+        """
+        clean = html.unescape(raw_text or "").strip()
+        clean = re.sub(r"<[^>]+>", " ", clean).strip()
+        clean = re.sub(r"\s+", " ", clean).strip()
+
+        # Normalize punctuation for generic phrase check
+        normalized_phrase = re.sub(r"[.!?,;:\-]+$", "", clean).strip().lower()
+        generic_phrases = {
+            "les mer", "read more", "søk her", "søk på stillingen", "se alle",
+            "vis mer", "ledige stillinger", "karriere", "careers", "jobs", "jobb",
+            "apply", "apply now", "view job", "se utlysningen", "se utlysningen her",
+            "les mer og søk her", "les mer og søk", "lese mer og søke her", "les mer her",
+            "se stillingen", "søk stilling", "send søknad", "søk", "more",
+        }
+
+        generic_prefixes = (
+            "les mer", "lese mer", "read more", "søk her", "søk på", "søk stilling",
+            "se utlysning", "se stilling", "se alle", "vis mer", "apply", "view job",
+            "send søknad", "åpne stilling", "ledige stillinger", "karriere", "careers",
+        )
+        is_generic = (
+            not clean
+            or len(clean) < 4
+            or normalized_phrase in generic_phrases
+            or any(normalized_phrase.startswith(p) for p in generic_prefixes)
+        )
+
+        if is_generic:
+            # Fallback to extracting title from URL path / slug
+            try:
+                parsed = urlparse(url)
+                path_parts = [p for p in parsed.path.split("/") if p]
+                if path_parts:
+                    slug = path_parts[-1]
+                    slug = re.sub(r"\.(?:aspx|html|php|htm|shtml)$", "", slug, flags=re.IGNORECASE)
+                    clean_slug = re.sub(r"^[0-9a-fA-F]{6,36}[-_]?", "", slug)
+                    clean_slug = re.sub(r"^[0-9]+[-_]", "", clean_slug)
+                    slug_title = re.sub(r"[-_]+", " ", clean_slug).strip()
+                    if len(slug_title) >= 4 and not slug_title.isdigit():
+                        return slug_title.capitalize()
+            except Exception:
+                pass
+
+        return clean
 
     @classmethod
     def get_circuit_status(cls) -> dict[str, Any]:
@@ -305,6 +382,7 @@ class JobVerifier:
 
                 return response, err
 
+        JobVerifier._pace_host(url)
         try:
             if self._http_client is not None:
                 response = self._http_client.get(url, headers=headers)
@@ -764,6 +842,7 @@ class JobVerifier:
         last_checked_url = website_url
 
         for page_url in urls_to_probe:
+            JobVerifier._pace_host(page_url)
             try:
                 if client is not None:
                     resp = client.get(page_url, headers=headers)
@@ -824,7 +903,7 @@ class JobVerifier:
                     if item_type != "JobPosting" and (not isinstance(item_type, list) or "JobPosting" not in item_type):
                         continue
 
-                    title = str(item.get("title") or item.get("name") or "").strip()
+                    title = html.unescape(str(item.get("title") or item.get("name") or "")).strip()
                     if not title or len(title) < 3:
                         continue
 
@@ -837,6 +916,7 @@ class JobVerifier:
                         employer_name = hiring_org.strip()
 
                     if employer_name:
+                        employer_name = html.unescape(employer_name).strip()
                         if not self.verify_employer_match(employer_name, legal_name):
                             continue
                     else:
@@ -900,21 +980,17 @@ class JobVerifier:
                     or "job_id=" in j_url
                     or ("teamtailor.com/jobs/" in j_url)
                     or ("jobbnorge.no/ledige-stillinger/stilling/" in j_url)
+                    or ("recman.no/job.php" in j_url or "recman.io/job/" in j_url)
+                    or ("webcruiter.no" in j_url or "webcruiter.com" in j_url)
+                    or ("reachmee.com" in j_url)
+                    or ("easycruit.com" in j_url)
+                    or ("workbuster." in j_url)
                 )
                 if not is_job_dest:
                     continue
 
-                j_title = re.sub(r"<[^>]+>", " ", j_raw_text).strip()
-                j_title = re.sub(r"\s+", " ", j_title).strip()
+                j_title = self.extract_title_from_slug_or_text(j_raw_text, j_url)
                 if len(j_title) < 4:
-                    continue
-
-                # Reject generic button phrases
-                if j_title.lower() in {
-                    "les mer", "read more", "søk her", "søk på stillingen", "se alle",
-                    "vis mer", "ledige stillinger", "karriere", "careers", "jobs", "jobb",
-                    "apply", "apply now", "view job",
-                }:
                     continue
 
                 # Check surrounding HTML for dates / deadline
