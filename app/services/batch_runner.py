@@ -1027,33 +1027,56 @@ class BatchRunner:
                 # 3. Individual job postings from NAV / Arbeidsplassen
                 requests_count += 1
                 try:
-                    profile.job_postings = self.job_verifier.fetch_nav_vacancies(
+                    nav_postings = self.job_verifier.fetch_nav_vacancies(
                         legal_name=profile.name,
                         org_nr=profile.org_nr,
                     )
-                    profile.job_search_status = getattr(profile.job_postings, "status", "completed")
+                    nav_status = getattr(nav_postings, "status", "completed")
                 except Exception:
-                    profile.job_postings = []
-                    profile.job_search_status = "failed"
+                    nav_postings = []
+                    nav_status = "failed"
 
-                # 3B. Career-page Schema.org JobPosting fallback when NAV is blocked or failed
-                if (
-                    profile.job_search_status in ("blocked", "failed")
-                    and profile.verified_website is not None
-                    and profile.verified_website.is_verified
-                ):
+                # 3B. Career-page & ATS discovery on verified company website
+                career_postings = []
+                if profile.verified_website is not None and profile.verified_website.is_verified:
+                    requests_count += 1
                     try:
-                        career_jobs = self.job_verifier.discover_career_vacancies(
+                        career_list = self.job_verifier.discover_career_vacancies(
                             website_url=profile.verified_website.final_url or profile.official_website,
                             legal_name=profile.name,
                             org_nr=profile.org_nr,
                             http_client=self.website_verifier._http_client,
+                            homepage_html=profile.verified_website.html_content,
                         )
-                        if career_jobs:
-                            profile.job_postings = career_jobs
-                            profile.job_search_status = "completed"
+                        if career_list is not None:
+                            career_postings = list(career_list)
                     except Exception:
                         pass
+
+                # Combine vacancies with deduplication
+                combined_jobs = []
+                seen_job_keys = set()
+                for job in (list(nav_postings) + career_postings):
+                    key = (
+                        re.sub(r"\W+", "", job.job_title.lower()),
+                        re.sub(r"\W+", "", job.employer_name.lower()),
+                        job.deadline_date or "",
+                    )
+                    if key not in seen_job_keys:
+                        seen_job_keys.add(key)
+                        combined_jobs.append(job)
+
+                profile.job_postings = combined_jobs
+
+                # Determine overall job search status
+                if combined_jobs:
+                    profile.job_search_status = "completed"
+                elif nav_status == "completed":
+                    profile.job_search_status = "completed"
+                elif nav_status == "blocked":
+                    profile.job_search_status = "blocked"
+                else:
+                    profile.job_search_status = "failed"
 
                 # 4. Corporate management and board roles (Phase 1)
                 requests_count += 1

@@ -23,6 +23,68 @@ GENERIC_CAREERS_PATTERNS = [
     r".*[?&](?:q|search|query)=.*",  # Search results pages
 ]
 
+# Expanded career paths on corporate websites (Norwegian & English)
+EXPANDED_CAREER_PATHS = [
+    "/karriere",
+    "/careers",
+    "/ledige-stillinger",
+    "/jobb",
+    "/om-oss/karriere",
+    "/om-oss/jobb",
+    "/jobb-hos-oss",
+    "/arbeide-hos-oss",
+    "/work-with-us",
+    "/vacancies",
+    "/jobs",
+    "/stillinger",
+]
+
+# Supported external ATS domains
+ATS_DOMAINS = [
+    "teamtailor.com",
+    "webcruiter.com",
+    "webcruiter.no",
+    "recman.no",
+    "recman.io",
+    "reachmee.com",
+    "easycruit.com",
+    "jobbnorge.no",
+    "workbuster.com",
+]
+
+# Keywords indicating career links in navigation menus
+CAREER_LINK_KEYWORDS = [
+    "karriere",
+    "ledige stillinger",
+    "jobb",
+    "careers",
+    "work with us",
+    "bli en av oss",
+    "vacancies",
+    "stillinger",
+    "jobber",
+    "open positions",
+]
+
+
+def parse_retry_after(header_val: Optional[str]) -> Optional[float]:
+    """Parse HTTP Retry-After header as seconds or HTTP date."""
+    if not header_val:
+        return None
+    val = header_val.strip()
+    try:
+        seconds = float(val)
+        return max(0.0, seconds)
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(val)
+        delta = (dt - datetime.now(timezone.utc)).total_seconds()
+        return max(0.0, delta)
+    except Exception:
+        return None
+
 
 class JobPostingList(list):
     """List of JobPosting objects with source search metadata for contract reporting."""
@@ -48,13 +110,13 @@ class JobVerifier:
     _circuit_lock = threading.Lock()
     _request_lock = threading.Lock()
     _last_request_ts = 0.0
-    _min_request_interval = 1.2  # Seconds after completion before next request starts
+    _min_request_interval = 2.5  # Conservative 2.5s minimum spacing between actual NAV requests
 
     # Process-wide NAV circuit breaker state across all instances
     _circuit_open: bool = False
     _consecutive_429: int = 0
-    _consecutive_429_threshold: int = 2
-    _circuit_cooldown_seconds: float = 120.0
+    _consecutive_429_threshold: int = 4  # Resilient threshold (4 consecutive 429s)
+    _circuit_cooldown_seconds: float = 30.0  # Base cooldown
     _circuit_blocked_until: float = 0.0
     _probe_in_flight: bool = False
 
@@ -73,6 +135,7 @@ class JobVerifier:
         cache_ttl_seconds: int = 86400,
         circuit_cooldown_seconds: Optional[float] = None,
         circuit_failure_threshold: Optional[int] = None,
+        min_request_interval: Optional[float] = None,
     ):
         self.base_api_url = base_api_url
         self.timeout = timeout
@@ -84,17 +147,23 @@ class JobVerifier:
             JobVerifier._circuit_cooldown_seconds = float(circuit_cooldown_seconds)
         if circuit_failure_threshold is not None:
             JobVerifier._consecutive_429_threshold = int(circuit_failure_threshold)
+        if min_request_interval is not None:
+            JobVerifier._min_request_interval = float(min_request_interval)
 
     @classmethod
     def configure_circuit_breaker(
         cls,
-        cooldown_seconds: float = 120.0,
-        failure_threshold: int = 2,
+        cooldown_seconds: float = 30.0,
+        failure_threshold: int = 4,
+        min_request_interval: Optional[float] = None,
     ) -> None:
-        """Configure circuit breaker parameters."""
+        """Configure circuit breaker and rate limiter parameters."""
         with cls._circuit_lock:
             cls._circuit_cooldown_seconds = float(cooldown_seconds)
             cls._consecutive_429_threshold = int(failure_threshold)
+        if min_request_interval is not None:
+            with cls._request_lock:
+                cls._min_request_interval = float(min_request_interval)
 
     @classmethod
     def reset_circuit_breaker(cls) -> None:
@@ -171,7 +240,11 @@ class JobVerifier:
                 cls._consecutive_429 += 1
                 if was_probe or cls._consecutive_429 >= cls._consecutive_429_threshold:
                     cls._circuit_open = True
-                    cls._circuit_blocked_until = now + cls._circuit_cooldown_seconds
+                    # Adaptive exponential backoff for cooldown, bounded up to 120s
+                    exp_factor = min(cls._consecutive_429 - cls._consecutive_429_threshold, 3) if not was_probe else 1
+                    mult = 2 ** max(0, exp_factor)
+                    cooldown = min(cls._circuit_cooldown_seconds * mult, 120.0)
+                    cls._circuit_blocked_until = now + cooldown
                     cls._probe_in_flight = False
             elif status_code == 200:
                 cls._consecutive_429 = 0
@@ -277,17 +350,14 @@ class JobVerifier:
         if not t_tokens or not c_tokens:
             return False
 
-        # First token of target is typically the primary brand (e.g. "Veidekke", "Telenor", "Kongsberg", "Bouvet", "Posten")
         primary_brand = t_tokens[0]
         c_primary = c_tokens[0]
 
         # Reject if candidate has a conflicting, distinct corporate brand prefix
-        # e.g., target 'Norsk Hydro' vs candidate 'Voith Hydro' (c_primary is 'voith' != 'norsk')
         if primary_brand != c_primary and c_primary not in t_tokens:
             return False
 
         if primary_brand in c_tokens:
-            # If primary brand matches, check that candidate is not an unrelated church/club/association
             unrelated_indicators = {"kirke", "menighet", "idrettslag", "klubb", "forening", "borettslag", "pensjonistforening"}
             if any(ind in c_emp for ind in unrelated_indicators) and not any(ind in t_name for ind in unrelated_indicators):
                 return False
@@ -307,6 +377,29 @@ class JobVerifier:
         clean_name = re.sub(r"[^\w]+", "_", legal_name.lower()).strip("_")
         return f"{clean_org}:{clean_name}:max_{max_results}"
 
+    @staticmethod
+    def get_canonical_search_term(legal_name: str) -> str:
+        """
+        Extract a single canonical search term from official company legal name.
+        Carefully strips standard corporate form suffixes without losing distinctive company name info.
+        """
+        clean_legal = re.sub(r"\s+", " ", legal_name).strip()
+        # Strip standard corporate forms at word boundaries
+        base = re.sub(
+            r"\b(?:ASA|AS|SF|ENK|DA|ANS|BA|FLI|NUF|IKS|KF)\b",
+            "",
+            clean_legal,
+            flags=re.IGNORECASE,
+        ).strip()
+        base = re.sub(r"\s+", " ", base).strip()
+        # Strip leading/trailing punctuation (e.g. "- P A L M E R A -" or "----ADVOKATFIRMAET...")
+        trimmed = re.sub(r"^[\s\-_.:;!#*]+|[\s\-_.:;!#*]+$", "", base).strip()
+        if len(trimmed) >= 2:
+            return trimmed
+        if len(base) >= 2:
+            return base
+        return clean_legal
+
     def fetch_nav_vacancies(
         self,
         legal_name: str,
@@ -315,8 +408,8 @@ class JobVerifier:
     ) -> JobPostingList:
         """
         Query NAV / Arbeidsplassen public API for individual vacancies.
-        Verifies employer entity match, extracts individual posting URLs, locations,
-        and application deadlines, and rejects generic career landing pages.
+        Uses single canonical search query per company to eliminate duplicate requests.
+        Enforces process-wide rate limiting, adaptive backoff, and circuit breaker.
         Returns a JobPostingList preserving search status (completed, blocked, or failed).
         """
         clean_legal = re.sub(r"\s+", " ", legal_name).strip()
@@ -333,22 +426,18 @@ class JobVerifier:
                 if cached is None and legacy_key != cache_key:
                     legacy_cached = self.db.get_job_search_cache(legacy_key)
                     if legacy_cached is not None:
-                        # Verify that legacy record actually belongs to this company name
                         l_name = legacy_cached.get("legal_name", "")
                         if self.verify_employer_match(l_name, clean_legal):
                             cached = legacy_cached
                         else:
-                            # Invalidate mismatched legacy entry to prevent cache pollution
                             self.db.invalidate_job_search_cache(legacy_key)
 
                 if cached is not None and cached.get("search_status") == "completed":
-                    # Deep verification of all cached vacancies against target company identity
                     is_valid = True
                     cached_postings: list[JobPosting] = []
                     c_org = cached.get("org_nr", "")
                     c_name = cached.get("legal_name", "")
 
-                    # Verify entity match between cached record and target
                     if c_org != clean_org and not self.verify_employer_match(c_name, clean_legal):
                         is_valid = False
 
@@ -356,7 +445,6 @@ class JobVerifier:
                         for v in cached.get("vacancies", []):
                             try:
                                 posting = JobPosting.model_validate(v)
-                                # Strict employer match verification for every single vacancy
                                 if not self.verify_employer_match(posting.employer_name, clean_legal):
                                     is_valid = False
                                     break
@@ -374,7 +462,6 @@ class JobVerifier:
                             error_message=None,
                         )
                     else:
-                        # Tainted or mismatched cache record: invalidate and purge
                         self.db.invalidate_job_search_cache(cache_key)
                         if legacy_key != cache_key:
                             self.db.invalidate_job_search_cache(legacy_key)
@@ -393,100 +480,72 @@ class JobVerifier:
             )
 
         acquired_probe = is_probe
+        canonical_term = self.get_canonical_search_term(clean_legal)
+        search_url = f"{self.base_api_url}?q={quote(canonical_term)}&size={max_results * 2}"
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": self.user_agent,
+        }
+
+        all_hits = []
+        search_status = "completed"
+        last_error = None
+
         try:
-            # Extract normalized company name without corporate form suffix
-            base_name = re.sub(
-                r"\b(?:ASA|AS|SF|ENK|DA|ANS|BA|FLI|NUF|IKS|KF)\b",
-                "",
-                clean_legal,
-                flags=re.IGNORECASE,
-            ).strip()
-            clean_base = re.sub(r"\s+", " ", base_name).strip()
+            response, err = self._execute_request(search_url, headers)
+            if err:
+                search_status = "failed"
+                last_error = err
+            elif response is None:
+                with JobVerifier._circuit_lock:
+                    circuit_is_open = JobVerifier._circuit_open
+                search_status = "blocked" if circuit_is_open else "failed"
+                last_error = "Request blocked or failed before execution"
+            elif response.status_code == 429:
+                search_status = "blocked"
+                last_error = "NAV Arbeidsplassen rate-limited (HTTP 429)"
 
-            # Prioritize search by clean base name (e.g. "Telenor", "Veidekke"), then legal name fallback
-            search_terms = []
-            if clean_base and len(clean_base) >= 2:
-                search_terms.append(clean_base)
-            if clean_legal not in search_terms:
-                search_terms.append(clean_legal)
+                # Check if circuit breaker opened on this 429
+                with JobVerifier._circuit_lock:
+                    circuit_is_open = JobVerifier._circuit_open
 
-            headers = {
-                "Accept": "application/json",
-                "User-Agent": self.user_agent,
-            }
-
-            all_hits = []
-            seen_uuids = set()
-            search_status = "completed"
-            last_search_url = ""
-            effective_term = search_terms[0] if search_terms else clean_legal
-            last_error = None
-
-            for term in search_terms:
-                effective_term = term
-                url = f"{self.base_api_url}?q={quote(term)}&size={max_results * 2}"
-                last_search_url = url
-
-                response, err = self._execute_request(url, headers)
-                if err:
-                    search_status = "failed"
-                    last_error = err
-                    continue
-
-                if response is None:
-                    search_status = "failed"
-                    continue
-
-                if response.status_code == 429:
-                    search_status = "blocked"
-                    last_error = "NAV Arbeidsplassen rate-limited (HTTP 429)"
-                    # Check if circuit breaker opened on this 429
-                    with JobVerifier._circuit_lock:
-                        circuit_is_open = JobVerifier._circuit_open
-                    if circuit_is_open:
-                        break
-
-                    # Conservative retry with backoff honoring Retry-After if provided
-                    backoff = 2.0
+                # If circuit is not open yet, attempt one bounded retry with backoff
+                if not circuit_is_open:
+                    backoff = 3.0
                     retry_header = response.headers.get("Retry-After")
-                    if retry_header:
-                        try:
-                            parsed_wait = float(retry_header.strip())
-                            backoff = min(max(parsed_wait, 1.0), 5.0)
-                        except Exception:
-                            backoff = 2.0
+                    parsed_retry = parse_retry_after(retry_header)
+                    if parsed_retry is not None:
+                        backoff = min(max(parsed_retry, 1.0), 30.0)
                     time.sleep(backoff)
-                    response, err = self._execute_request(url, headers)
+                    response, err = self._execute_request(search_url, headers)
                     if response and response.status_code == 200:
                         search_status = "completed"
-                    else:
+                        last_error = None
+                    elif response and response.status_code == 429:
                         search_status = "blocked"
-                        last_error = err or "NAV Arbeidsplassen rate-limited on retry (HTTP 429)"
-                        break
+                        last_error = "NAV Arbeidsplassen rate-limited on retry (HTTP 429)"
+                    else:
+                        search_status = "failed" if (response and response.status_code >= 500) else "blocked"
+                        last_error = err or f"NAV error {response.status_code if response else 'none'}"
 
-                if response.status_code != 200:
-                    search_status = "failed" if response.status_code >= 500 else "blocked"
-                    continue
-
+            if response is not None and response.status_code == 200:
                 try:
                     payload = response.json()
+                    raw_hits = payload.get("hits", {})
+                    hit_list = raw_hits.get("hits", []) if isinstance(raw_hits, dict) else []
+                    seen_uuids = set()
+                    for h in hit_list:
+                        uuid = h.get("_source", {}).get("uuid")
+                        if uuid and uuid not in seen_uuids:
+                            seen_uuids.add(uuid)
+                            all_hits.append(h)
+                    search_status = "completed"
                 except Exception as e:
                     search_status = "failed"
-                    last_error = str(e)
-                    continue
-
-                raw_hits = payload.get("hits", {})
-                hit_list = raw_hits.get("hits", []) if isinstance(raw_hits, dict) else []
-                for h in hit_list:
-                    uuid = h.get("_source", {}).get("uuid")
-                    if uuid and uuid not in seen_uuids:
-                        seen_uuids.add(uuid)
-                        all_hits.append(h)
-
-                search_status = "completed"
-                # Single-query optimization: if first term yielded hits, do not query the second term
-                if all_hits:
-                    break
+                    last_error = f"JSON parse error: {e}"
+            elif response is not None and response.status_code != 200 and search_status != "blocked":
+                search_status = "failed" if response.status_code >= 500 else "blocked"
+                last_error = f"HTTP {response.status_code}"
         finally:
             if acquired_probe:
                 JobVerifier._release_probe_if_abandoned()
@@ -580,8 +639,8 @@ class JobVerifier:
                     vacancies=vacancies_dicts,
                     retrieved_at=retrieved_at_iso,
                     expires_at=expires_at_iso,
-                    search_url=last_search_url or self.base_api_url,
-                    query_term=effective_term,
+                    search_url=search_url,
+                    query_term=canonical_term,
                 )
             except Exception:
                 pass
@@ -589,10 +648,59 @@ class JobVerifier:
         return JobPostingList(
             postings,
             status=search_status,
-            search_url=last_search_url or self.base_api_url,
-            query_term=effective_term,
+            search_url=search_url,
+            query_term=canonical_term,
             error_message=last_error,
         )
+
+    @staticmethod
+    def extract_career_links_from_html(html: str, base_url: str) -> tuple[list[str], list[str]]:
+        """
+        Inspect HTML for career-related links.
+        Returns:
+            (internal_career_urls, ats_urls)
+        """
+        internal_urls = []
+        ats_urls = []
+        base_host = urlparse(base_url).netloc.lower()
+
+        # Extract all <a href="..."> tags
+        matches = re.findall(r'<a\s+[^>]*href=[\'"]([^\'"#]+)[\'"][^>]*>(.*?)</a>', html, re.DOTALL | re.IGNORECASE)
+        seen = set()
+
+        for raw_href, raw_text in matches:
+            href = raw_href.strip()
+            if not href or href.startswith(("javascript:", "mailto:", "tel:")):
+                continue
+            text = re.sub(r"<[^>]+>", "", raw_text).strip().lower()
+            full_url = urljoin(base_url, href)
+            clean_url = full_url.split("#")[0].strip()
+            if not clean_url or clean_url in seen:
+                continue
+
+            parsed = urlparse(clean_url)
+            parsed_host = parsed.netloc.lower()
+
+            # Check if this points to a known ATS provider
+            is_ats = any(ats in parsed_host for ats in ATS_DOMAINS)
+            if is_ats:
+                seen.add(clean_url)
+                ats_urls.append(clean_url)
+                continue
+
+            # Check if on same domain and matches career keywords
+            is_same_domain = (parsed_host == base_host) or (parsed_host.endswith("." + base_host))
+            if is_same_domain:
+                url_path_lower = parsed.path.lower()
+                matches_keyword = any(kw in text for kw in CAREER_LINK_KEYWORDS) or any(
+                    kw.replace(" ", "-") in url_path_lower or kw.replace(" ", "") in url_path_lower
+                    for kw in CAREER_LINK_KEYWORDS
+                )
+                if matches_keyword:
+                    seen.add(clean_url)
+                    internal_urls.append(clean_url)
+
+        return internal_urls, ats_urls
 
     def discover_career_vacancies(
         self,
@@ -601,48 +709,99 @@ class JobVerifier:
         org_nr: str,
         http_client: Optional[httpx.Client] = None,
         max_results: int = 10,
+        homepage_html: Optional[str] = None,
     ) -> Optional[JobPostingList]:
         """
-        Discover individual job vacancies on company career pages via Schema.org JobPosting structured data.
-        Serves as a reliable fallback when NAV Arbeidsplassen is rate-limited or blocked.
-        Ensures employer matches target company and filters expired vacancies.
+        Discover individual job vacancies on verified company websites and linked ATS destinations.
+        Uses Schema.org JobPosting structured data and semantic HTML job card extraction.
+        Applies strict employer identity verification and filters expired vacancies.
         """
         if not website_url:
             return None
 
-        career_paths = ["/karriere", "/careers", "/ledige-stillinger", "/jobb"]
         client = http_client or self._http_client
-
         headers = {
-            "Accept": "text/html,application/xhtml+xml",
+            "Accept": "text/html,application/xhtml+xml,application/json",
             "User-Agent": self.user_agent,
         }
-
         now_date_str = utc_now().strftime("%Y-%m-%d")
 
-        for path in career_paths:
-            cand_url = urljoin(website_url, path)
+        # 1. Gather candidate URLs: expanded career paths + navigation links
+        candidate_urls: list[str] = []
+        ats_urls: list[str] = []
+
+        # Propose standard paths
+        for path in EXPANDED_CAREER_PATHS:
+            cand = urljoin(website_url, path)
+            if cand not in candidate_urls:
+                candidate_urls.append(cand)
+
+        # Inspect homepage HTML for career and ATS links if available
+        html_to_scan = homepage_html
+        if not html_to_scan:
             try:
                 if client is not None:
-                    resp = client.get(cand_url, headers=headers)
+                    h_resp = client.get(website_url, headers=headers)
                 else:
                     with httpx.Client(timeout=4.0, follow_redirects=True) as hclient:
-                        resp = hclient.get(cand_url, headers=headers)
+                        h_resp = hclient.get(website_url, headers=headers)
+                if h_resp.status_code == 200 and h_resp.text:
+                    html_to_scan = h_resp.text[:1048576]
+            except Exception:
+                pass
+
+        if html_to_scan:
+            extracted_career, extracted_ats = self.extract_career_links_from_html(html_to_scan, website_url)
+            for u in extracted_career:
+                if u not in candidate_urls:
+                    candidate_urls.insert(0, u)  # Prioritize explicit navigation links
+            ats_urls.extend(extracted_ats)
+
+        # Target list to probe: top candidate URLs (max 4) + ATS URLs (max 2)
+        urls_to_probe = candidate_urls[:4] + ats_urls[:2]
+        discovered_postings: list[JobPosting] = []
+        checked_sources = 0
+        last_checked_url = website_url
+
+        for page_url in urls_to_probe:
+            try:
+                if client is not None:
+                    resp = client.get(page_url, headers=headers)
+                else:
+                    with httpx.Client(timeout=4.0, follow_redirects=True) as hclient:
+                        resp = hclient.get(page_url, headers=headers)
             except Exception:
                 continue
 
             if resp.status_code != 200 or not resp.text:
                 continue
 
-            html = resp.text[:1048576]  # Max 1MB
+            checked_sources += 1
+            last_checked_url = page_url
+            page_html = resp.text[:1048576]  # Max 1MB
+
+            # Check if this is an ATS URL: verify employer match before attributing
+            is_ats = any(ats in urlparse(page_url).netloc.lower() for ats in ATS_DOMAINS)
+            if is_ats:
+                # Do not treat an ATS provider's domain alone as proof that a vacancy belongs to the target company
+                ats_netloc = urlparse(page_url).netloc.lower()
+                ats_title_match = re.search(r"<title[^>]*>(.*?)</title>", page_html, re.IGNORECASE)
+                ats_title = ats_title_match.group(1).strip() if ats_title_match else ""
+                netloc_tokens = ats_netloc.split(".")
+                ats_subdomain = netloc_tokens[0] if len(netloc_tokens) > 2 else ""
+                is_company_ats = (
+                    self.verify_employer_match(ats_subdomain, legal_name)
+                    or (ats_title and self.verify_employer_match(ats_title, legal_name))
+                )
+                if not is_company_ats:
+                    continue  # Mismatched or generic ATS page; reject
+
+            # A. Schema.org JobPosting (JSON-LD)
             json_ld_blocks = re.findall(
                 r'<script[^>]+type=[\'"]application/ld\+json[\'"][^>]*>(.*?)</script>',
-                html,
+                page_html,
                 re.DOTALL | re.IGNORECASE,
             )
-
-            candidate_postings: list[JobPosting] = []
-
             for block in json_ld_blocks:
                 try:
                     data = json.loads(block.strip())
@@ -677,7 +836,6 @@ class JobVerifier:
                     elif isinstance(hiring_org, str):
                         employer_name = hiring_org.strip()
 
-                    # Verify employer match if employer name is provided
                     if employer_name:
                         if not self.verify_employer_match(employer_name, legal_name):
                             continue
@@ -688,18 +846,15 @@ class JobVerifier:
                     valid_through = item.get("validThrough")
                     deadline_str = str(valid_through)[:10] if valid_through else None
                     if deadline_str and deadline_str < now_date_str:
-                        # Expired vacancy
+                        continue  # Expired vacancy
+
+                    pub_date = str(item.get("datePosted"))[:10] if item.get("datePosted") else None
+                    raw_ad_url = item.get("url") or item.get("mainEntityOfPage") or page_url
+                    ad_url = urljoin(page_url, str(raw_ad_url).strip())
+
+                    if self.is_generic_careers_url(ad_url):
                         continue
 
-                    # Publication date / datePosted
-                    date_posted = item.get("datePosted")
-                    pub_date = str(date_posted)[:10] if date_posted else None
-
-                    # Advertisement URL
-                    raw_ad_url = item.get("url") or item.get("mainEntityOfPage") or cand_url
-                    ad_url = urljoin(cand_url, str(raw_ad_url).strip())
-
-                    # Location
                     loc_val = item.get("jobLocation")
                     loc_str = None
                     if isinstance(loc_val, dict):
@@ -711,7 +866,7 @@ class JobVerifier:
                     elif isinstance(loc_val, str):
                         loc_str = loc_val
 
-                    candidate_postings.append(
+                    discovered_postings.append(
                         JobPosting(
                             job_title=title,
                             employer_name=employer_name,
@@ -721,17 +876,108 @@ class JobVerifier:
                             publication_date=pub_date,
                             deadline_date=deadline_str,
                             is_active=True,
-                            evidence_span=f"Verified Schema.org JobPosting on {cand_url}: '{title}' for '{employer_name}'.",
+                            evidence_span=f"Verified Schema.org JobPosting on {page_url}: '{title}' for '{employer_name}'.",
                         )
                     )
 
-            if candidate_postings:
-                return JobPostingList(
-                    candidate_postings[:max_results],
-                    status="completed",
-                    search_url=cand_url,
-                    query_term=legal_name,
-                    error_message=None,
+            # B. Semantic HTML job card extraction (when JSON-LD is absent or partial)
+            job_link_matches = re.findall(
+                r'<a\s+[^>]*href=[\'"]([^\'"#]+)[\'"][^>]*>(.*?)</a>',
+                page_html,
+                re.DOTALL | re.IGNORECASE,
+            )
+            for j_href, j_raw_text in job_link_matches:
+                j_url = urljoin(page_url, j_href.strip())
+                if self.is_generic_careers_url(j_url):
+                    continue
+
+                is_job_dest = bool(
+                    re.search(
+                        r"/(?:stilling|stillinger|job|jobs|position|positions|ledig-stilling|vacancies)/[a-zA-Z0-9_\-]+",
+                        j_url,
+                        re.IGNORECASE,
+                    )
+                    or "job_id=" in j_url
+                    or ("teamtailor.com/jobs/" in j_url)
+                    or ("jobbnorge.no/ledige-stillinger/stilling/" in j_url)
                 )
+                if not is_job_dest:
+                    continue
+
+                j_title = re.sub(r"<[^>]+>", " ", j_raw_text).strip()
+                j_title = re.sub(r"\s+", " ", j_title).strip()
+                if len(j_title) < 4:
+                    continue
+
+                # Reject generic button phrases
+                if j_title.lower() in {
+                    "les mer", "read more", "søk her", "søk på stillingen", "se alle",
+                    "vis mer", "ledige stillinger", "karriere", "careers", "jobs", "jobb",
+                    "apply", "apply now", "view job",
+                }:
+                    continue
+
+                # Check surrounding HTML for dates / deadline
+                deadline_val = None
+                deadline_match = re.search(
+                    r"(?:frist|deadline|søknadsfrist)[:\s]*([0-9]{1,2}\.[0-9]{1,2}\.[0-9]{4}|[0-9]{4}-[0-9]{2}-[0-9]{2})",
+                    page_html,
+                    re.IGNORECASE,
+                )
+                if deadline_match:
+                    d_raw = deadline_match.group(1)
+                    if "-" in d_raw:
+                        deadline_val = d_raw
+                    elif "." in d_raw:
+                        parts = d_raw.split(".")
+                        if len(parts) == 3 and len(parts[2]) == 4:
+                            deadline_val = f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
+
+                if deadline_val and deadline_val < now_date_str:
+                    continue  # Expired
+
+                discovered_postings.append(
+                    JobPosting(
+                        job_title=j_title,
+                        employer_name=legal_name,
+                        employer_org_nr=org_nr,
+                        advertisement_url=j_url,
+                        location=None,
+                        publication_date=None,
+                        deadline_date=deadline_val,
+                        is_active=True,
+                        evidence_span=f"Verified career listing on {page_url}: '{j_title}' for '{legal_name}'.",
+                    )
+                )
+
+            if discovered_postings:
+                break
+
+        # Deduplicate candidate postings
+        unique_postings: list[JobPosting] = []
+        seen_keys = set()
+        for p in discovered_postings:
+            d_key = (re.sub(r"\W+", "", p.job_title.lower()), p.deadline_date or "")
+            if d_key not in seen_keys:
+                seen_keys.add(d_key)
+                unique_postings.append(p)
+
+        if unique_postings:
+            return JobPostingList(
+                unique_postings[:max_results],
+                status="completed",
+                search_url=last_checked_url,
+                query_term=legal_name,
+                error_message=None,
+            )
+
+        if checked_sources > 0:
+            return JobPostingList(
+                [],
+                status="completed",
+                search_url=last_checked_url,
+                query_term=legal_name,
+                error_message=None,
+            )
 
         return None
