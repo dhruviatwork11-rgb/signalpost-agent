@@ -432,10 +432,15 @@ class JobVerifier:
         if c_emp == t_name or c_emp in t_name or t_name in c_emp:
             return True
 
-        # Strip standard corporate and geographic suffixes
-        generic_suffixes = {"as", "asa", "avd", "norge", "norway", "holding", "group", "gruppen"}
-        c_tokens = [tok for tok in c_emp.split() if tok not in generic_suffixes and len(tok) >= 3]
-        t_tokens = [tok for tok in t_name.split() if tok not in generic_suffixes and len(tok) >= 3]
+        # Strip standard corporate, geographic, and generic business suffixes
+        generic_tokens = {
+            "as", "asa", "avd", "norge", "norway", "holding", "group", "gruppen",
+            "oslo", "bergen", "trondheim", "stavanger", "tromsø", "kristiansand", "drammen",
+            "nord", "sør", "øst", "vest", "nordic", "scandinavia",
+            "bygg", "invest", "data", "consulting", "service", "services", "tjenester", "eiendom"
+        }
+        c_tokens = [tok for tok in c_emp.split() if tok not in {"as", "asa", "avd", "norge", "norway", "holding", "group", "gruppen"} and len(tok) >= 3]
+        t_tokens = [tok for tok in t_name.split() if tok not in {"as", "asa", "avd", "norge", "norway", "holding", "group", "gruppen"} and len(tok) >= 3]
 
         if not t_tokens or not c_tokens:
             return False
@@ -443,19 +448,27 @@ class JobVerifier:
         primary_brand = t_tokens[0]
         c_primary = c_tokens[0]
 
-        # Reject if candidate has a conflicting, distinct corporate brand prefix
-        if primary_brand != c_primary and c_primary not in t_tokens:
+        # Distinctive tokens excluding geographic and generic terms
+        distinctive_t = [t for t in t_tokens if t not in generic_tokens and not t.isdigit()]
+        distinctive_c = [c for c in c_tokens if c not in generic_tokens and not c.isdigit()]
+
+        if not distinctive_t or not distinctive_c:
             return False
 
-        if primary_brand in c_tokens:
+        # Reject if candidate has a conflicting, distinct corporate brand prefix
+        if primary_brand not in generic_tokens and c_primary not in generic_tokens:
+            if primary_brand != c_primary and c_primary not in t_tokens:
+                return False
+
+        if primary_brand in c_tokens and primary_brand not in generic_tokens:
             unrelated_indicators = {"kirke", "menighet", "idrettslag", "klubb", "forening", "borettslag", "pensjonistforening"}
             if any(ind in c_emp for ind in unrelated_indicators) and not any(ind in t_name for ind in unrelated_indicators):
                 return False
             return True
 
         # Check general distinctive token overlap
-        common = set(c_tokens) & set(t_tokens)
-        if common - {"bygg", "invest", "data", "consulting", "service", "eiendom"}:
+        common = set(distinctive_c) & set(distinctive_t)
+        if common:
             return True
 
         return False
