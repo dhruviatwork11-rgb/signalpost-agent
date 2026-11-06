@@ -52,6 +52,13 @@ ATS_DOMAINS = [
     "jobbnorge.no",
     "workbuster.com",
     "workbuster.se",
+    "myworkdayjobs.com",
+    "workday.com",
+    "greenhouse.io",
+    "lever.co",
+    "talentech.com",
+    "jobylon.com",
+    "varbi.com",
 ]
 
 # Keywords indicating career links in navigation menus
@@ -205,6 +212,32 @@ class JobVerifier:
             pass
 
     @staticmethod
+    def clean_vacancy_title(title: str) -> str:
+        """Strip trailing metadata and boilerplates from vacancy titles."""
+        s = html.unescape(title or "").strip()
+        s = re.sub(r"<[^>]+>", " ", s).strip()
+        s = re.sub(r"\s+", " ", s).strip()
+        split_patterns = [
+            r"\s+Location:\s+",
+            r"\s+Arbeidssted:\s+",
+            r"\s+Sted:\s+",
+            r"\s+Frist:\s+",
+            r"\s+Søknadsfrist:\s+",
+            r"\s+Deadline:\s+",
+            r"\s+read more\b",
+            r"\s+les mer\b",
+            r"\s+Les mer og søk\b",
+            r"\s+Apply now\b",
+            r"\s*\|\s*Apply\b",
+        ]
+        for pat in split_patterns:
+            parts = re.split(pat, s, flags=re.IGNORECASE)
+            if parts and len(parts[0].strip()) >= 3:
+                s = parts[0].strip()
+        s = re.sub(r"^[\s\-_.:;!#*|]+|[\s\-_.:;!#*|]+$", "", s).strip()
+        return s
+
+    @staticmethod
     def extract_title_from_slug_or_text(raw_text: str, url: str) -> str:
         """
         Extract clean job vacancy title, unescaping HTML entities and
@@ -252,7 +285,7 @@ class JobVerifier:
             except Exception:
                 pass
 
-        return clean
+        return JobVerifier.clean_vacancy_title(clean)
 
     @classmethod
     def get_circuit_status(cls) -> dict[str, Any]:
@@ -791,8 +824,9 @@ class JobVerifier:
                 ats_urls.append(clean_url)
                 continue
 
-            # Check if on same domain and matches career keywords
-            is_same_domain = (parsed_host == base_host) or (parsed_host.endswith("." + base_host))
+            # Check if on same domain (including subdomains like careers.example.com) and matches career keywords
+            root_base = base_host[4:] if base_host.startswith("www.") else base_host
+            is_same_domain = (parsed_host == base_host) or (parsed_host == root_base) or (parsed_host.endswith("." + root_base))
             if is_same_domain:
                 url_path_lower = parsed.path.lower()
                 matches_keyword = any(kw in text for kw in CAREER_LINK_KEYWORDS) or any(
@@ -804,6 +838,65 @@ class JobVerifier:
                     internal_urls.append(clean_url)
 
         return internal_urls, ats_urls
+
+    def _fetch_workday_vacancies(
+        self,
+        workday_url: str,
+        legal_name: str,
+        org_nr: str,
+        client: Optional[httpx.Client] = None,
+        max_results: int = 10,
+    ) -> list[JobPosting]:
+        """Fetch structured active vacancies from public Workday career portal CXS JSON API."""
+        parsed = urlparse(workday_url)
+        host = parsed.netloc.lower()
+        parts = [p for p in parsed.path.split("/") if p]
+        if not parts:
+            return []
+        site = parts[0]
+        tenant = host.split(".")[0]
+        if not self.verify_employer_match(tenant, legal_name) and not self.verify_employer_match(site, legal_name):
+            return []
+
+        api_url = f"https://{host}/wday/cxs/{tenant}/{site}/jobs"
+        postings: list[JobPosting] = []
+        try:
+            payload = {"appliedFacets": {}, "limit": max_results, "offset": 0, "searchText": ""}
+            headers = {
+                "User-Agent": self.user_agent,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
+            if client is not None:
+                resp = client.post(api_url, json=payload, headers=headers)
+            else:
+                with httpx.Client(timeout=6.0) as c:
+                    resp = c.post(api_url, json=payload, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                for item in data.get("jobPostings", []):
+                    title = (item.get("title") or "").strip()
+                    ext_path = (item.get("externalPath") or "").strip()
+                    if not title or not ext_path:
+                        continue
+                    ad_url = f"https://{host}/{site}{ext_path}"
+                    clean_title = self.clean_vacancy_title(title)
+                    postings.append(
+                        JobPosting(
+                            job_title=clean_title,
+                            employer_name=legal_name,
+                            employer_org_nr=org_nr,
+                            advertisement_url=ad_url,
+                            location=item.get("locationsText"),
+                            publication_date=item.get("postedOn"),
+                            deadline_date=None,
+                            is_active=True,
+                            evidence_span=f"Verified Workday ATS vacancy on {host}: '{clean_title}' for '{legal_name}'.",
+                        )
+                    )
+        except Exception:
+            pass
+        return postings
 
     def discover_career_vacancies(
         self,
@@ -883,6 +976,21 @@ class JobVerifier:
             checked_sources += 1
             last_checked_url = page_url
             page_html = resp.text[:1048576]  # Max 1MB
+
+            # Check if this is a Workday ATS URL
+            if "myworkdayjobs.com" in page_url:
+                w_jobs = self._fetch_workday_vacancies(page_url, legal_name, org_nr, client, max_results)
+                if w_jobs:
+                    discovered_postings.extend(w_jobs)
+                    break
+
+            # Check if page links out to a Workday careers site
+            workday_match = re.search(r'href=[\'"](https://[^\'"]*myworkdayjobs\.com/[^\'"#]+)[\'"]', page_html, re.IGNORECASE)
+            if workday_match:
+                w_url = workday_match.group(1).strip()
+                w_jobs = self._fetch_workday_vacancies(w_url, legal_name, org_nr, client, max_results)
+                if w_jobs:
+                    discovered_postings.extend(w_jobs)
 
             # Check if this is an ATS URL: verify employer match before attributing
             is_ats = any(ats in urlparse(page_url).netloc.lower() for ats in ATS_DOMAINS)
@@ -973,7 +1081,7 @@ class JobVerifier:
 
                     discovered_postings.append(
                         JobPosting(
-                            job_title=title,
+                            job_title=self.clean_vacancy_title(title),
                             employer_name=employer_name,
                             employer_org_nr=org_nr,
                             advertisement_url=ad_url,
@@ -996,6 +1104,10 @@ class JobVerifier:
                 if self.is_generic_careers_url(j_url):
                     continue
 
+                # Filter non-vacancy utility links
+                if any(u in j_url.lower() for u in ["/career-center/login", "/login", "/sign-in", "/registrer-cv", "/register", "/connect", "/candidate", "privacy-policy", "terms", "cookie"]):
+                    continue
+
                 is_job_dest = bool(
                     re.search(
                         r"/(?:stilling|stillinger|job|jobs|position|positions|ledig-stilling|vacancies)/[a-zA-Z0-9_\-]+",
@@ -1008,13 +1120,17 @@ class JobVerifier:
                     or ("recman.no/job.php" in j_url or "recman.io/job/" in j_url)
                     or ("webcruiter.no" in j_url or "webcruiter.com" in j_url)
                     or ("reachmee.com" in j_url)
-                    or ("easycruit.com" in j_url)
+                    or ("easycruit.com" in j_url and not any(p in j_url.lower() for p in ["/login", "/register", "iso="]))
                     or ("workbuster." in j_url)
+                    or ("greenhouse.io" in j_url and "/jobs/" in j_url)
+                    or ("lever.co" in j_url and len(urlparse(j_url).path.strip("/").split("/")) >= 2)
+                    or ("talentech." in j_url and "/jobs/" in j_url)
                 )
                 if not is_job_dest:
                     continue
 
-                j_title = self.extract_title_from_slug_or_text(j_raw_text, j_url)
+                raw_j_title = self.extract_title_from_slug_or_text(j_raw_text, j_url)
+                j_title = self.clean_vacancy_title(raw_j_title)
                 if len(j_title) < 4:
                     continue
 

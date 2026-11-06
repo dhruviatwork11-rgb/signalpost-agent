@@ -164,7 +164,81 @@ class WebsiteVerifier:
                 html_content=content_text,
             )
 
-        # 4. Domain reached, but neither org number nor legal name confirmed -> Ambiguous
+        # 4. Registry-supplied domain matching normalized legal name or distinctive brand
+        if is_registry_supplied:
+            # Normalize registry name peculiarities (e.g., '@' -> 'ø', '+' -> 'pluss', '(HUB)')
+            s_norm = re.sub(r"\+", "pluss ", clean_name)
+            s_norm = re.sub(r"@(?=[A-Za-z])", "ø", s_norm)
+            s_norm = re.sub(r"^\([^)]+\)\s*", "", s_norm)
+            s_norm = re.sub(r"\b(?:ASA|AS|SF|ENK|DA|ANS|BA|FLI|NUF|IKS|KF)\b", "", s_norm, flags=re.IGNORECASE).strip()
+            s_norm = re.sub(r"^[\s\-_.:;!#*]+|[\s\-_.:;!#*]+$", "", s_norm).strip()
+
+            # Check primary brand token in domain and title
+            root_domain = final_domain.split(":")[0]
+            generic_brand_tokens = {"group", "holding", "invest", "consulting", "service", "services", "tjenester", "eiendom", "data", "norge", "norway"}
+            brand_tokens = [t for t in re.findall(r"[A-Za-z0-9øæå]+", s_norm.lower()) if len(t) >= 3 and t not in generic_brand_tokens]
+            if brand_tokens and len(s_norm.split()) >= 2:
+                p_brand = brand_tokens[0]
+                brand_variants = {p_brand, p_brand.replace("ø", "oe"), p_brand.replace("ø", "o")}
+                domain_matches_brand = any(v in root_domain for v in brand_variants)
+
+                title_match = re.search(r"<title[^>]*>(.*?)</title>", content_text, re.IGNORECASE)
+                page_title = title_match.group(1).lower() if title_match else ""
+                title_or_headings_match = any(v in page_title or v in content_text[:10000].lower() for v in brand_variants)
+
+                if domain_matches_brand and title_or_headings_match and len(p_brand) >= 5:
+                    return VerifiedWebsite(
+                        candidate_url=candidate_url,
+                        final_url=final_url,
+                        is_verified=True,
+                        verification_status="verified",
+                        is_parent_or_group=False,
+                        evidence_span=f"Verified registry domain '{root_domain}' matching company brand '{p_brand}'.",
+                        html_content=content_text,
+                    )
+
+            # 5. Check common Norwegian contact / about / investor subpages for org number or legal name
+            sub_paths = ["/investor-relations", "/investor", "/om-oss", "/om", "/kontakt", "/kontakt-oss", "/about", "/contact"]
+            parsed_final = urlparse(final_url)
+            base_origin = f"{parsed_final.scheme}://{parsed_final.netloc}"
+            for sp in sub_paths:
+                sub_url = f"{base_origin}{sp}"
+                try:
+                    if self._http_client is not None:
+                        sub_resp = self._http_client.get(sub_url, headers=headers, follow_redirects=True)
+                    else:
+                        with httpx.Client(timeout=self.timeout, follow_redirects=True) as sub_client:
+                            sub_resp = sub_client.get(sub_url, headers=headers)
+                    if sub_resp.status_code == 200 and sub_resp.text:
+                        sub_text = sub_resp.text[:524288]
+                        sub_org_match = org_pattern.search(sub_text)
+                        if sub_org_match:
+                            span_start = max(0, sub_org_match.start() - 30)
+                            span_end = min(len(sub_text), sub_org_match.end() + 30)
+                            snippet = re.sub(r"\s+", " ", sub_text[span_start:span_end]).strip()
+                            return VerifiedWebsite(
+                                candidate_url=candidate_url,
+                                final_url=final_url,
+                                is_verified=True,
+                                verification_status="verified",
+                                is_parent_or_group=False,
+                                evidence_span=f"Found organisation number {org_nr} on subpage {sub_url}: '{snippet}'",
+                                html_content=content_text,
+                            )
+                        if clean_name.lower() in sub_text.lower():
+                            return VerifiedWebsite(
+                                candidate_url=candidate_url,
+                                final_url=final_url,
+                                is_verified=True,
+                                verification_status="verified",
+                                is_parent_or_group=False,
+                                evidence_span=f"Found exact legal entity name '{clean_name}' on subpage {sub_url}.",
+                                html_content=content_text,
+                            )
+                except Exception:
+                    continue
+
+        # 7. Domain reached, but neither org number nor legal name confirmed -> Ambiguous
         return VerifiedWebsite(
             candidate_url=candidate_url,
             final_url=final_url,
