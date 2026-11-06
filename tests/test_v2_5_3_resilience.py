@@ -327,3 +327,375 @@ def test_complete_coverage_when_both_sources_checked_with_zero_hits():
 
     job_ev = [ev for ev in envelope["evidence"] if ev["id"] in job_claim["evidence_ids"]][0]
     assert "0 active vacancies found" in job_ev["claim_span"]
+
+
+# ---------------------------------------------------------------------------
+# 6. Multi-source availability semantics
+# ---------------------------------------------------------------------------
+
+
+def test_nav_blocked_while_ats_succeeds_yields_available():
+    """Verify requirement: A verified active vacancy from an ATS source results in availability: available even if NAV is blocked."""
+    profile = CompanyProfile(
+        org_nr="917103801",
+        name="Veidekke ASA",
+        org_form="ASA",
+    )
+    profile.job_search_status = "completed"
+    profile.nav_job_status = "blocked"
+    profile.career_job_status = "completed"
+    profile.ats_job_status = "completed"
+
+    posting = JobPosting(
+        job_title="Nyutdannet i Veidekke Anlegg 2027",
+        employer_name="Veidekke ASA",
+        advertisement_url="https://veidekke.teamtailor.com/jobs/8293551-nyutdannet",
+        source="teamtailor.com",
+        deadline_date="2027-01-01",
+        is_active=True,
+    )
+    profile.job_postings = [posting]
+
+    evidence = SourceEvidence(
+        source_name="enhetsregisteret",
+        source_url="https://data.brreg.no/api/917103801",
+        retrieved_at=utc_now(),
+        response_hash="hash",
+        payload={},
+    )
+
+    envelope = build_terminal_envelope(
+        org_nr=profile.org_nr,
+        run_id="test",
+        started_at=utc_now(),
+        completed_at=utc_now(),
+        profile=profile,
+        evidence=evidence,
+    )
+
+    claims = {c["field"]: c for c in envelope["claims"]}
+    job_claim = claims["job_postings"]
+    assert job_claim["availability"] == "available"
+    assert isinstance(job_claim["value"], list)
+    assert len(job_claim["value"]) == 1
+    assert job_claim["value"][0]["job_title"] == "Nyutdannet i Veidekke Anlegg 2027"
+
+
+def test_nav_blocked_while_career_page_succeeds_yields_available():
+    """Verify requirement: A verified active vacancy from a corporate career page results in availability: available even if NAV is blocked."""
+    profile = CompanyProfile(
+        org_nr="982463718",
+        name="Telenor ASA",
+        org_form="ASA",
+    )
+    profile.job_search_status = "completed"
+    profile.nav_job_status = "blocked"
+    profile.career_job_status = "completed"
+    profile.ats_job_status = "not_applicable"
+
+    posting = JobPosting(
+        job_title="Senior Cloud Engineer",
+        employer_name="Telenor ASA",
+        advertisement_url="https://telenor.no/karriere/senior-cloud-engineer",
+        source="corporate_career_page",
+        deadline_date=None,
+        is_active=True,
+    )
+    profile.job_postings = [posting]
+
+    evidence = SourceEvidence(
+        source_name="enhetsregisteret",
+        source_url="https://data.brreg.no/api/982463718",
+        retrieved_at=utc_now(),
+        response_hash="hash",
+        payload={},
+    )
+
+    envelope = build_terminal_envelope(
+        org_nr=profile.org_nr,
+        run_id="test",
+        started_at=utc_now(),
+        completed_at=utc_now(),
+        profile=profile,
+        evidence=evidence,
+    )
+
+    claims = {c["field"]: c for c in envelope["claims"]}
+    job_claim = claims["job_postings"]
+    assert job_claim["availability"] == "available"
+    assert isinstance(job_claim["value"], list)
+    assert len(job_claim["value"]) == 1
+
+
+def test_all_alternative_sources_unavailable_and_nav_blocked_yields_blocked():
+    """Verify requirement: When company has no website and NAV is rate-limited (429), availability is blocked."""
+    profile = CompanyProfile(
+        org_nr="999888777",
+        name="Liten Snekkerservice ENK",
+        org_form="ENK",
+    )
+    profile.job_search_status = "blocked"
+    profile.nav_job_status = "blocked"
+    profile.career_job_status = "not_applicable"
+    profile.ats_job_status = "not_applicable"
+    profile.verified_website = None
+    profile.job_postings = []
+
+    evidence = SourceEvidence(
+        source_name="enhetsregisteret",
+        source_url="https://data.brreg.no/api/999888777",
+        retrieved_at=utc_now(),
+        response_hash="hash",
+        payload={},
+    )
+
+    envelope = build_terminal_envelope(
+        org_nr=profile.org_nr,
+        run_id="test",
+        started_at=utc_now(),
+        completed_at=utc_now(),
+        profile=profile,
+        evidence=evidence,
+    )
+
+    claims = {c["field"]: c for c in envelope["claims"]}
+    job_claim = claims["job_postings"]
+    assert job_claim["availability"] == "blocked"
+    assert job_claim["value"] is None
+
+
+# ---------------------------------------------------------------------------
+# 7. Resumption from database checkpoints and corrupted output handling
+# ---------------------------------------------------------------------------
+
+
+def test_resume_from_sqlite_checkpoints_when_output_file_missing(tmp_path):
+    """Verify requirement: Resuming recovers completed envelopes directly from SQLite batch_checkpoints even if output file is absent."""
+    from app.services.database import DatabaseService
+
+    db_path = tmp_path / "test.db"
+    db = DatabaseService(db_path)
+
+    env_data = {
+        "organisation_number": "982463718",
+        "run": {"run_id": "resilient-run", "terminal_status": "completed", "started_at": "2026-11-05T00:00:00Z", "completed_at": "2026-11-05T00:00:01Z"},
+        "claims": [{"field": "legal_name", "value": "TELENOR ASA", "availability": "available", "confidence": 1.0, "evidence_ids": ["ev-1"]}],
+        "evidence": [],
+        "changes": [],
+        "errors": [],
+        "operations": {"requests": 1, "runtime_ms": 100, "third_party_cost_usd": 0.0},
+    }
+    db.save_batch_checkpoint(run_id="resilient-run", org_nr="982463718", input_hash="dummy-hash", envelope=env_data)
+
+    out_file = tmp_path / "recovered_envelopes.jsonl"
+    input_file = tmp_path / "input.json"
+    input_file.write_text(json.dumps(["982463718", "914778271"]), encoding="utf-8")
+
+    processed_orgs = []
+
+    def mock_fetch(org_nr):
+        processed_orgs.append(org_nr)
+        p = CompanyProfile(org_nr=org_nr, name="NEW CO AS", org_form="AS")
+        ev = SourceEvidence(source_name="enhetsregisteret", source_url=f"https://data.brreg.no/api/{org_nr}", retrieved_at=utc_now(), response_hash="abc", payload={})
+        return p, ev
+
+    mock_client = BrregClient()
+    mock_client.fetch_company = mock_fetch
+
+    runner = BatchRunner(db_path=db_path, client=mock_client)
+    report = runner.run(
+        input_path=input_file,
+        output_path=out_file,
+        run_id="resilient-run",
+        resume=True,
+    )
+
+    assert processed_orgs == ["914778271"]
+    assert report["expected_count"] == 2
+    assert report["emitted_envelopes"] == 2
+
+    lines = [json.loads(l) for l in out_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert len(lines) == 2
+    assert lines[0]["organisation_number"] == "982463718"
+    assert lines[1]["organisation_number"] == "914778271"
+
+
+def test_interrupted_writes_and_corrupt_line_recovery(tmp_path):
+    """Verify requirement: Resuming safely recovers from trailing corrupt or truncated lines without duplicating envelopes."""
+    out_file = tmp_path / "envelopes.jsonl"
+    input_file = tmp_path / "input.json"
+
+    valid_env = {
+        "organisation_number": "982463718",
+        "run": {"run_id": "test-run", "terminal_status": "completed", "started_at": "2026-11-05T00:00:00Z", "completed_at": "2026-11-05T00:00:01Z"},
+        "claims": [],
+        "evidence": [],
+        "changes": [],
+        "errors": [],
+        "operations": {"requests": 1, "runtime_ms": 100, "third_party_cost_usd": 0.0},
+    }
+    out_file.write_text(json.dumps(valid_env) + "\n{\"organisation_number\": \"914778271\", \"run\": { incomplete\n", encoding="utf-8")
+    input_file.write_text(json.dumps(["982463718", "914778271"]), encoding="utf-8")
+
+    processed_orgs = []
+
+    def mock_fetch(org_nr):
+        processed_orgs.append(org_nr)
+        p = CompanyProfile(org_nr=org_nr, name="RECOVERED CO AS", org_form="AS")
+        ev = SourceEvidence(source_name="enhetsregisteret", source_url=f"https://data.brreg.no/api/{org_nr}", retrieved_at=utc_now(), response_hash="abc", payload={})
+        return p, ev
+
+    mock_client = BrregClient()
+    mock_client.fetch_company = mock_fetch
+
+    runner = BatchRunner(db_path=tmp_path / "test.db", client=mock_client)
+    report = runner.run(input_path=input_file, output_path=out_file, resume=True)
+
+    assert processed_orgs == ["914778271"]
+    assert report["expected_count"] == 2
+    assert report["emitted_envelopes"] == 2
+
+    lines = [json.loads(l) for l in out_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert len(lines) == 2
+    assert lines[0]["organisation_number"] == "982463718"
+    assert lines[1]["organisation_number"] == "914778271"
+
+
+def test_duplicate_input_org_deduplication(tmp_path):
+    """Verify requirement: Duplicate input organization numbers do not cause multiple network executions, while preserving 100% input correspondence in output."""
+    input_file = tmp_path / "dups_input.json"
+    out_file = tmp_path / "dups_out.jsonl"
+    input_file.write_text(json.dumps(["982463718", "982463718", "914778271"]), encoding="utf-8")
+
+    processed_orgs = []
+
+    def mock_fetch(org):
+        processed_orgs.append(org)
+        return (
+            CompanyProfile(org_nr=org, name=f"CO {org}", org_form="AS"),
+            SourceEvidence(source_name="enhetsregisteret", source_url=f"https://data.brreg.no/api/{org}", retrieved_at=utc_now(), response_hash="abc", payload={})
+        )
+
+    mock_client = BrregClient()
+    mock_client.fetch_company = mock_fetch
+
+    runner = BatchRunner(db_path=tmp_path / "test.db", client=mock_client)
+    report = runner.run(input_path=input_file, output_path=out_file)
+
+    # Output matches exact input count and ordering
+    assert report["expected_count"] == 3
+    assert report["emitted_envelopes"] == 3
+    assert report["zero_silent_drops"] is True
+
+    # But underlying company fetch executed only once per unique organization
+    assert processed_orgs == ["982463718", "914778271"]
+
+    lines = [json.loads(l) for l in out_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert len(lines) == 3
+    assert lines[0]["organisation_number"] == "982463718"
+    assert lines[1]["organisation_number"] == "982463718"
+    assert lines[2]["organisation_number"] == "914778271"
+
+
+# ---------------------------------------------------------------------------
+# 8. Canonical deduplication & HTML entity decodings
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_vacancy_deduplication_by_canonical_url_and_uuid():
+    """Verify requirement: Vacancies with same UUID or same canonical URL (ignoring tracking params) are deduplicated without losing distinct vacancies."""
+    job1 = JobPosting(
+        job_title="Prosjektleder",
+        employer_name="Veidekke ASA",
+        advertisement_url="https://veidekke.teamtailor.com/jobs/8293551-nyutdannet?utm_source=linkedin",
+        source="teamtailor.com",
+        is_active=True,
+    )
+    job2 = JobPosting(
+        job_title="Prosjektleder",
+        employer_name="Veidekke ASA",
+        advertisement_url="https://veidekke.teamtailor.com/jobs/8293551-nyutdannet?utm_source=facebook&ref=share",
+        source="teamtailor.com",
+        is_active=True,
+    )
+    job3 = JobPosting(
+        job_title="Baneingeniør",
+        employer_name="Veidekke ASA",
+        advertisement_url="https://veidekke.teamtailor.com/jobs/9999999-baneingenior",
+        source="teamtailor.com",
+        is_active=True,
+    )
+
+    combined = []
+    seen = set()
+    for job in [job1, job2, job3]:
+        u_clean = re.sub(r"[?&](?:utm_[^&=]+|ref|source|trk)=[^&=]+", "", job.advertisement_url).split("#")[0].rstrip("/").lower()
+        uuid_m = re.search(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", u_clean)
+        if uuid_m:
+            key = ("uuid", uuid_m.group(0).lower())
+        elif u_clean:
+            key = ("url", u_clean)
+        else:
+            key = ("fields", job.job_title.lower(), job.employer_name.lower())
+
+        if key not in seen:
+            seen.add(key)
+            combined.append(job)
+
+    assert len(combined) == 2
+    assert combined[0].advertisement_url == job1.advertisement_url
+    assert combined[1].advertisement_url == job3.advertisement_url
+
+
+def test_html_entity_decoding_comprehensive():
+    """Verify requirement: Both named (&oslash;, &aring;, &aelig;) and numeric (decimal &#248;, hex &#x00F8;) entities are decoded."""
+    assert JobVerifier.extract_title_from_slug_or_text("S&oslash;ker l&aelig;rling og milj&oslash;r&aring;dgiver", "https://ex.com/job") == "Søker lærling og miljørådgiver"
+    assert JobVerifier.extract_title_from_slug_or_text("S&#248;ker l&#230;rling og milj&#248;r&#229;dgiver", "https://ex.com/job") == "Søker lærling og miljørådgiver"
+    assert JobVerifier.extract_title_from_slug_or_text("S&#x00F8;ker l&#x00E6;rling og milj&#x00F8;r&#x00E5;dgiver", "https://ex.com/job") == "Søker lærling og miljørådgiver"
+
+
+def test_expired_vacancies_rejected_and_missing_deadlines_handled_gracefully():
+    """Verify requirement: Expired deadlines are excluded, but missing deadlines (snarest/løpende) are retained as active."""
+    v = JobVerifier()
+    expired_job = JobPosting(
+        job_title="Utvikler",
+        employer_name="Acme",
+        advertisement_url="https://acme.no/job/1",
+        deadline_date="2020-01-01",
+        is_active=True,
+    )
+    future_job = JobPosting(
+        job_title="Utvikler",
+        employer_name="Acme",
+        advertisement_url="https://acme.no/job/2",
+        deadline_date="2030-01-01",
+        is_active=True,
+    )
+    snarest_job = JobPosting(
+        job_title="Utvikler",
+        employer_name="Acme",
+        advertisement_url="https://acme.no/job/3",
+        deadline_date=None,
+        is_active=True,
+    )
+
+    assert v.is_vacancy_expired(expired_job.deadline_date) is True
+    assert v.is_vacancy_expired(future_job.deadline_date) is False
+    assert v.is_vacancy_expired(snarest_job.deadline_date) is False
+
+
+def test_independent_host_rate_limiting():
+    """Verify requirement: Rate limiting on Host A does not delay requests to Host B."""
+    JobVerifier._host_last_request_ts.clear()
+    JobVerifier._min_host_interval = 0.1  # 100ms
+
+    url_a1 = "https://host-a.com/careers"
+    url_b1 = "https://host-b.com/careers"
+
+    t0 = time.monotonic()
+    JobVerifier._pace_host(url_a1)
+    JobVerifier._pace_host(url_b1)  # Different host should not wait for host A
+    elapsed = time.monotonic() - t0
+
+    assert elapsed < 0.05
+

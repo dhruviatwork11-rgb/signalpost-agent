@@ -232,7 +232,19 @@ class CompanyProfile(BaseModel):
     )
     job_search_status: str = Field(
         default="completed",
-        description="NAV Arbeidsplassen search status: completed, blocked, failed, or not_checked",
+        description="Overall vacancy search status: completed, blocked, failed, or not_checked",
+    )
+    nav_job_status: Optional[str] = Field(
+        default=None,
+        description="NAV Arbeidsplassen search status: completed, blocked, failed",
+    )
+    career_job_status: Optional[str] = Field(
+        default=None,
+        description="Corporate career page search status: completed, not_applicable, failed",
+    )
+    ats_job_status: Optional[str] = Field(
+        default=None,
+        description="ATS platforms search status: completed, not_applicable, failed",
     )
     news_search_status: str = Field(
         default="completed",

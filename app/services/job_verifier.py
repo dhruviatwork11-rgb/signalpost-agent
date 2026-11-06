@@ -412,6 +412,18 @@ class JobVerifier:
         return False
 
     @staticmethod
+    def is_vacancy_expired(deadline_str: Optional[str]) -> bool:
+        """Return True if deadline_str is a valid date that is strictly in the past."""
+        if not deadline_str:
+            return False
+        try:
+            now_date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            clean_date = str(deadline_str)[:10]
+            return clean_date < now_date_str
+        except Exception:
+            return False
+
+    @staticmethod
     def verify_employer_match(candidate_employer: str, target_legal_name: str) -> bool:
         """Verify that the advertising employer matches the target legal company entity."""
         c_emp = re.sub(r"[^\w\s]", "", candidate_employer.lower()).strip()

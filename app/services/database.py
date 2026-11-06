@@ -131,6 +131,18 @@ def init_db(db_path: Path | str) -> None:
                     query_term TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_job_cache_org ON job_search_cache (org_nr);
+
+                -- Batch processing checkpoints for resilient resumption
+                CREATE TABLE IF NOT EXISTS batch_checkpoints (
+                    run_id TEXT NOT NULL,
+                    org_nr TEXT NOT NULL,
+                    input_hash TEXT,
+                    envelope_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (run_id, org_nr)
+                );
+                CREATE INDEX IF NOT EXISTS idx_batch_checkpoints_run ON batch_checkpoints (run_id);
+                CREATE INDEX IF NOT EXISTS idx_batch_checkpoints_hash ON batch_checkpoints (input_hash);
                 """
             )
             # Automatic schema migration for existing databases
@@ -739,5 +751,78 @@ class DatabaseService:
                 )
         except Exception:
             pass
+        finally:
+            conn.close()
+
+    def save_batch_checkpoint(
+        self,
+        run_id: str,
+        org_nr: str,
+        input_hash: str,
+        envelope: dict[str, Any],
+    ) -> None:
+        """Persist a single terminal envelope checkpoint atomically to SQLite."""
+        conn = self.get_connection()
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO batch_checkpoints (run_id, org_nr, input_hash, envelope_json, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(run_id, org_nr) DO UPDATE SET
+                        input_hash = excluded.input_hash,
+                        envelope_json = excluded.envelope_json,
+                        created_at = excluded.created_at
+                    """,
+                    (
+                        run_id,
+                        org_nr,
+                        input_hash,
+                        json.dumps(envelope, ensure_ascii=False),
+                        utc_now().isoformat(),
+                    ),
+                )
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
+    def get_batch_checkpoints(self, run_id: str) -> dict[str, dict[str, Any]]:
+        """Retrieve all completed checkpoints for a given run ID."""
+        conn = self.get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT org_nr, envelope_json FROM batch_checkpoints WHERE run_id = ?",
+                (run_id,),
+            ).fetchall()
+            checkpoints = {}
+            for r in rows:
+                try:
+                    checkpoints[r["org_nr"]] = json.loads(r["envelope_json"])
+                except Exception:
+                    pass
+            return checkpoints
+        except Exception:
+            return {}
+        finally:
+            conn.close()
+
+    def get_checkpoints_by_input_hash(self, input_hash: str) -> dict[str, dict[str, Any]]:
+        """Retrieve all completed checkpoints for an input file content hash."""
+        conn = self.get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT org_nr, envelope_json FROM batch_checkpoints WHERE input_hash = ?",
+                (input_hash,),
+            ).fetchall()
+            checkpoints = {}
+            for r in rows:
+                try:
+                    checkpoints[r["org_nr"]] = json.loads(r["envelope_json"])
+                except Exception:
+                    pass
+            return checkpoints
+        except Exception:
+            return {}
         finally:
             conn.close()

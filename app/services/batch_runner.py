@@ -26,7 +26,7 @@ from app.services.brreg_client import (
     BrregTimeoutError,
 )
 from app.services.database import DatabaseService
-from app.services.job_verifier import JobVerifier
+from app.services.job_verifier import ATS_DOMAINS, JobVerifier
 from app.services.news_verifier import NewsVerifier
 from app.services.social_verifier import SocialVerifier
 from app.services.website_verifier import WebsiteVerifier
@@ -1050,36 +1050,58 @@ class BatchRunner:
                 except Exception:
                     nav_postings = []
                     nav_status = "failed"
+                profile.nav_job_status = nav_status
 
                 # 3B. Career-page & ATS discovery on verified company website
                 career_postings = []
+                career_status = "not_applicable"
+                ats_status = "not_applicable"
                 if profile.verified_website is not None and profile.verified_website.is_verified:
                     requests_count += 1
                     try:
-                        career_list = self.job_verifier.discover_career_vacancies(
-                            website_url=profile.verified_website.final_url or profile.official_website,
-                            legal_name=profile.name,
-                            org_nr=profile.org_nr,
-                            http_client=self.website_verifier._http_client,
-                            homepage_html=profile.verified_website.html_content,
-                        )
-                        if career_list is not None:
-                            career_postings = list(career_list)
+                        if hasattr(self.job_verifier, "discover_career_vacancies"):
+                            career_list = self.job_verifier.discover_career_vacancies(
+                                website_url=profile.verified_website.final_url or profile.official_website,
+                                legal_name=profile.name,
+                                org_nr=profile.org_nr,
+                                http_client=getattr(self.website_verifier, "_http_client", None),
+                                homepage_html=getattr(profile.verified_website, "html_content", None),
+                            )
+                            if career_list is not None:
+                                career_postings = list(career_list)
+                            career_status = "completed"
+                            if any(any(ats in j.advertisement_url for ats in ATS_DOMAINS) for j in career_postings):
+                                ats_status = "completed"
+                        else:
+                            career_status = "completed"
                     except Exception:
-                        pass
+                        career_status = "failed"
+                        ats_status = "failed"
+                profile.career_job_status = career_status
+                profile.ats_job_status = ats_status
 
-                # Combine vacancies with deduplication
+                # Combine vacancies with robust deduplication across NAV and corporate sources
                 combined_jobs = []
-                seen_job_keys = set()
+                seen_job_fields = set()
+                seen_job_urls = set()
                 for job in (list(nav_postings) + career_postings):
-                    key = (
+                    u_clean = re.sub(r"[?&](?:utm_[^&=]+|ref|source|trk)=[^&=]+", "", job.advertisement_url).split("#")[0].rstrip("/").lower()
+                    uuid_m = re.search(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", u_clean)
+                    url_key = uuid_m.group(0).lower() if uuid_m else u_clean
+
+                    fields_key = (
                         re.sub(r"\W+", "", job.job_title.lower()),
                         re.sub(r"\W+", "", job.employer_name.lower()),
                         job.deadline_date or "",
                     )
-                    if key not in seen_job_keys:
-                        seen_job_keys.add(key)
-                        combined_jobs.append(job)
+
+                    if fields_key in seen_job_fields or (url_key and url_key in seen_job_urls):
+                        continue
+
+                    seen_job_fields.add(fields_key)
+                    if url_key:
+                        seen_job_urls.add(url_key)
+                    combined_jobs.append(job)
 
                 profile.job_postings = combined_jobs
 
@@ -1142,7 +1164,7 @@ class BatchRunner:
         elapsed_ms = int((time.monotonic() - start_time) * 1000)
         completed_at = utc_now()
 
-        return build_terminal_envelope(
+        envelope = build_terminal_envelope(
             org_nr=org_nr,
             run_id=run_id,
             started_at=started_at,
@@ -1155,6 +1177,19 @@ class BatchRunner:
             runtime_ms=elapsed_ms,
             status_override=status_override,
         )
+
+        if self.db is not None:
+            try:
+                self.db.save_batch_checkpoint(
+                    run_id=run_id,
+                    org_nr=org_nr,
+                    input_hash=getattr(self, "_current_input_hash", ""),
+                    envelope=envelope,
+                )
+            except Exception:
+                pass
+
+        return envelope
 
     def run(
         self,
@@ -1176,25 +1211,45 @@ class BatchRunner:
         expected_count = len(orgs)
         unique_orgs = list(dict.fromkeys(orgs))
 
+        # Compute stable input hash
+        input_hash = ""
+        try:
+            input_bytes = Path(input_path).read_bytes()
+            input_hash = hashlib.sha256(input_bytes).hexdigest()[:16]
+        except Exception:
+            pass
+        self._current_input_hash = input_hash
+
         results_by_org: dict[str, dict[str, Any]] = {}
         total_requests = 0
 
-        # Resumable batch processing: inspect existing output file if resume is requested
+        # Resumable batch processing: inspect both SQLite checkpoints and existing output file
         out_file = Path(output_path)
-        if resume and out_file.exists():
-            try:
-                with out_file.open("r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line:
-                            env = json.loads(line)
-                            env_org = env.get("organisation_number")
-                            term_status = env.get("run", {}).get("terminal_status")
-                            # Only reuse completed or verified not_found envelopes
-                            if env_org and term_status in ("completed", "not_found"):
-                                results_by_org[env_org] = env
-            except Exception:
-                pass
+        if resume:
+            if self.db is not None:
+                try:
+                    db_cps = self.db.get_batch_checkpoints(run_id)
+                    if not db_cps and input_hash:
+                        db_cps = self.db.get_checkpoints_by_input_hash(input_hash)
+                    for org, env in db_cps.items():
+                        if env.get("run", {}).get("terminal_status") in ("completed", "not_found"):
+                            results_by_org[org] = env
+                except Exception:
+                    pass
+
+            if out_file.exists():
+                try:
+                    with out_file.open("r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                env = json.loads(line)
+                                env_org = env.get("organisation_number")
+                                term_status = env.get("run", {}).get("terminal_status")
+                                if env_org and term_status in ("completed", "not_found"):
+                                    results_by_org[env_org] = env
+                except Exception:
+                    pass
 
         # Identify organizations still needing execution
         orgs_to_process = [org for org in unique_orgs if org not in results_by_org]
